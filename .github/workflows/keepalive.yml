@@ -1,0 +1,37 @@
+# Keeps the free-tier Supabase project from pausing, but only until a date.
+#
+# Switch: the repository variable KEEPALIVE_UNTIL (YYYY-MM-DD).
+#   On:  gh variable set KEEPALIVE_UNTIL -b 2027-01-15
+#        (or Settings -> Secrets and variables -> Actions -> Variables)
+#   Off: let the date pass, or gh variable delete KEEPALIVE_UNTIL
+# If the project already paused, click Restore in the Supabase dashboard first.
+# GitHub disables scheduled workflows after 60 days without commits; re-enable
+# this one from the Actions tab if that happens.
+name: Supabase keep-alive
+
+on:
+  schedule:
+    - cron: "17 15 * * *"   # daily, 15:17 UTC
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping only while the switch is on
+        env:
+          UNTIL: ${{ vars.KEEPALIVE_UNTIL }}
+        run: |
+          today=$(date -u +%F)
+          if [ -z "$UNTIL" ] || [[ "$today" > "$UNTIL" ]]; then
+            echo "Keep-alive is off (KEEPALIVE_UNTIL='${UNTIL}'); skipping."
+            exit 0
+          fi
+          # Public read with the publishable key (already public in config.public.json).
+          url=$(jq -r .SUPABASE_URL < <(curl -sf "https://nexkiv.github.io/conference-rag/config.public.json"))
+          key=$(jq -r .SUPABASE_PUBLISHABLE_KEY < <(curl -sf "https://nexkiv.github.io/conference-rag/config.public.json"))
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$url/rest/v1/page_views?select=id&limit=1" -H "apikey: $key")
+          echo "Pinged page_views: HTTP $code (on until $UNTIL)"
+          [ "$code" = "200" ]

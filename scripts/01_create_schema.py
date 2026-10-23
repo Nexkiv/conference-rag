@@ -185,6 +185,8 @@ RETURNS TABLE (
     title text,
     speaker text,
     url text,
+    year int,
+    season text,
     text text,
     similarity float,
     talk_sentences int
@@ -206,13 +208,13 @@ BEGIN
 
     RETURN QUERY
     WITH hits AS (
-        SELECT s.id, s.talk_id, s.title, s.speaker, s.url, s.text,
+        SELECT s.id, s.talk_id, s.title, s.speaker, s.url, s.year, s.season, s.text,
                1 - (s.embedding <=> query_embedding) AS similarity
         FROM public.sentence_embeddings s
         ORDER BY s.embedding <=> query_embedding
         LIMIT least(greatest(match_count, 1), 50)
     )
-    SELECT h.id, h.talk_id, h.title, h.speaker, h.url, h.text, h.similarity::float,
+    SELECT h.id, h.talk_id, h.title, h.speaker, h.url, h.year, h.season, h.text, h.similarity::float,
            -- Talk length, so the browser can rank talks by sum / sqrt(length).
            (SELECT count(*)::int FROM public.sentence_embeddings c WHERE c.talk_id = h.talk_id)
     FROM hits h
@@ -221,6 +223,79 @@ END;
 $$;
 REVOKE ALL ON FUNCTION public.match_sentences(extensions.halfvec, int) FROM public, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.match_sentences(extensions.halfvec, int) TO authenticated;
+
+-- ============================================
+-- keyword_search: ILIKE search, ranked per talk
+-- ============================================
+-- Each talk that uses the words (or has them in its title) gets
+--     score = (matching sentences + 5 * title_match) / sqrt(talk sentences)
+-- so a title match is worth 5 extra mentions: it helps, but a talk that
+-- uses the words much more often can still outrank it. The sqrt keeps long
+-- talks from winning on volume alone (same idea as the RAG ranking).
+-- Returns up to 3 matching sentences per talk (or the opening sentence for a
+-- title-only match). SECURITY INVOKER: runs as the caller, so RLS and the
+-- column grants above still apply. %, _ and ! in the query are escaped with !
+-- (ESCAPE '!'), so they match literally.
+DROP FUNCTION IF EXISTS public.keyword_search(text, int);
+CREATE FUNCTION public.keyword_search(q text, max_talks int DEFAULT 10)
+RETURNS TABLE (
+    talk_id uuid,
+    title text,
+    speaker text,
+    url text,
+    year int,
+    season text,
+    text text,
+    title_match boolean,
+    hits int,
+    score float
+)
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = public
+AS $$
+    WITH pat AS (
+        SELECT '%' || replace(replace(replace(left(q, 500), '!', '!!'), '%', '!%'), '_', '!_') || '%' AS p
+    ),
+    matches AS (
+        SELECT s.talk_id, s.sentence_num, s.text
+        FROM public.sentence_embeddings s, pat
+        WHERE s.text ILIKE pat.p ESCAPE '!'
+    ),
+    talks AS (
+        SELECT s.talk_id,
+               min(s.title) AS title, min(s.speaker) AS speaker, min(s.url) AS url,
+               min(s.year) AS year, min(s.season) AS season,
+               count(*) AS n,
+               bool_or(s.title ILIKE pat.p ESCAPE '!') AS title_match
+        FROM public.sentence_embeddings s, pat
+        WHERE s.talk_id IN (SELECT m.talk_id FROM matches m) OR s.title ILIKE pat.p ESCAPE '!'
+        GROUP BY s.talk_id
+    ),
+    ranked AS (
+        SELECT t.*, h.hits,
+               ((h.hits + 5 * t.title_match::int) / sqrt(t.n))::float AS score
+        FROM talks t
+        CROSS JOIN LATERAL (
+            SELECT count(*)::int AS hits FROM matches m WHERE m.talk_id = t.talk_id
+        ) h
+        ORDER BY score DESC, t.year DESC
+        LIMIT least(greatest(max_talks, 1), 20)
+    )
+    SELECT r.talk_id, r.title, r.speaker, r.url, r.year, r.season, x.text, r.title_match, r.hits, r.score
+    FROM ranked r
+    CROSS JOIN LATERAL (
+        (SELECT m.text, m.sentence_num FROM matches m
+         WHERE m.talk_id = r.talk_id ORDER BY m.sentence_num LIMIT 3)
+        UNION ALL
+        (SELECT s.text, s.sentence_num FROM public.sentence_embeddings s
+         WHERE s.talk_id = r.talk_id AND r.hits = 0 ORDER BY s.sentence_num LIMIT 1)
+    ) x
+    ORDER BY r.score DESC, r.year DESC, r.talk_id, x.sentence_num;
+$$;
+REVOKE ALL ON FUNCTION public.keyword_search(text, int) FROM public, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.keyword_search(text, int) TO authenticated;
 
 NOTIFY pgrst, 'reload schema';
 """

@@ -286,6 +286,7 @@ function showApp(user) {
     if (userEmailSpan) userEmailSpan.textContent = user.email;
     // Check search readiness when user logs in
     checkSearchReadiness();
+    loadHistory();
 }
 
 function showMessage(text, type) {
@@ -409,12 +410,10 @@ async function keywordSearch() {
     clearResults('keyword');
 
     try {
-        // Search sentence_embeddings that contain the keyword (case-insensitive)
+        // keyword_search() ranks talks by (mentions + 5 x title match) / sqrt(length)
+        // and returns up to 3 matching sentences each (see scripts/01_create_schema.py).
         const { data, error } = await supabaseClient
-            .from('sentence_embeddings')
-            .select('text, talk_id, title, speaker, url')
-            .ilike('text', `%${query}%`)
-            .limit(20);
+            .rpc('keyword_search', { q: query, max_talks: 10 });
 
         if (error) throw new Error(`Search failed: ${error.message}`);
 
@@ -432,6 +431,9 @@ async function keywordSearch() {
                     title: row.title || 'Unknown Talk',
                     speaker: row.speaker || 'Unknown Speaker',
                     url: row.url || '',
+                    conference: conferenceLabel(row),
+                    titleMatch: row.title_match,
+                    hits: row.hits,
                     sentences: []
                 };
             }
@@ -441,8 +443,11 @@ async function keywordSearch() {
         let html = '';
         for (const talk of Object.values(talks)) {
             html += `<div class="result-card">
-                <div class="result-title"><a href="${escapeHtml(talk.url)}" target="_blank" class="result-title-link">${escapeHtml(talk.title)}</a></div>
-                <div class="result-speaker">by ${escapeHtml(talk.speaker)}</div>
+                <div class="result-card-header">
+                    <div class="result-title"><a href="${escapeHtml(talk.url)}" target="_blank" class="result-title-link">${highlightKeyword(talk.title, query)}</a></div>
+                    ${talk.titleMatch ? '<span class="similarity-badge similarity-high">Title match</span>' : ''}
+                </div>
+                <div class="result-speaker">${speakerLine(talk)} · ${talk.hits} matching sentence${talk.hits === 1 ? '' : 's'}</div>
                 <div class="result-sentences">${talk.sentences.slice(0, 3).join('<br>')}</div>
             </div>`;
         }
@@ -453,6 +458,16 @@ async function keywordSearch() {
     } finally {
         showLoading(false);
     }
+}
+
+// "October 2025": which General Conference a talk is from.
+function conferenceLabel(row) {
+    return row.season && row.year ? `${row.season} ${row.year}` : '';
+}
+
+function speakerLine(talk) {
+    const by = `by ${escapeHtml(talk.speaker || 'Unknown Speaker')}`;
+    return talk.conference ? `${by} · ${escapeHtml(talk.conference)}` : by;
 }
 
 function highlightKeyword(text, keyword) {
@@ -493,7 +508,7 @@ async function semanticSearch() {
                 <div class="result-card-header">
                     <div>
                         <div class="result-title"><a href="${escapeHtml(result.url)}" target="_blank" class="result-title-link">${escapeHtml(result.title)}</a></div>
-                        <div class="result-speaker">by ${escapeHtml(result.speaker)}</div>
+                        <div class="result-speaker">${speakerLine({ ...result, conference: conferenceLabel(result) })}</div>
                     </div>
                     ${badge}
                 </div>
@@ -559,13 +574,14 @@ async function askQuestion() {
                 <div class="result-card-header">
                     <div>
                         <div class="result-title"><a href="${escapeHtml(talk.url)}" target="_blank" class="result-title-link">${escapeHtml(talk.title)}</a></div>
-                        <div class="result-speaker">by ${escapeHtml(talk.speaker)}</div>
+                        <div class="result-speaker">${speakerLine(talk)}</div>
                     </div>
                     ${talkBadge}
                 </div>
             </div>`;
         }
         showResults('rag', html);
+        loadHistory();
 
     } catch (error) {
         showResults('rag', `<div class="result-error">Error: ${escapeHtml(error.message)}</div>`);
@@ -585,7 +601,8 @@ async function getEmbedding(text) {
     });
 
     if (error) {
-        throw new Error(data?.error || 'Failed to get embedding');
+        const body = await error.context?.json?.().catch(() => null);
+        throw new Error(body?.error || 'Failed to get embedding');
     }
 
     return data.embedding;
@@ -615,6 +632,7 @@ function groupByTalk(sentences) {
                 title: sent.title,
                 speaker: sent.speaker,
                 url: sent.url,
+                conference: conferenceLabel(sent),
                 sentences: [],
                 totalSimilarity: 0,
                 talkSentences: sent.talk_sentences || 1
@@ -635,6 +653,7 @@ function groupByTalk(sentences) {
             title: talk.title,
             speaker: talk.speaker,
             url: talk.url,
+            conference: talk.conference,
             text: talk.sentences.join(' '),
             score: score(talk),
             // Average is still the clearest number to show as a badge.
@@ -687,7 +706,12 @@ async function generateAnswer(question, contextTalks) {
     });
 
     if (error) {
-        throw new Error(data?.error || 'Failed to generate answer');
+        // On a non-2xx reply supabase-js gives the Response in error.context.
+        const body = await error.context?.json?.().catch(() => null);
+        if (error.context?.status === 429) {
+            throw new Error('You have reached the limit of 20 questions per hour. Please try again later.');
+        }
+        throw new Error(body?.error || 'Failed to generate answer');
     }
 
     return data.answer;
@@ -771,6 +795,67 @@ function fetchDeployTimestamp() {
             deployDateEl.textContent = 'unknown';
         });
 }
+
+// ============================================
+// MY QUESTIONS (per-user history)
+// ============================================
+// The query has no user filter on purpose: RLS adds "user_id = auth.uid()"
+// inside the database, so each user only ever gets their own rows.
+
+const historyResults = document.getElementById('history-results');
+const historyRefreshBtn = document.getElementById('history-refresh');
+
+// Only show links to the talk site; history sources are never trusted as HTML or URLs.
+function safeTalkUrl(url) {
+    return typeof url === 'string' && url.startsWith('https://www.churchofjesuschrist.org/') ? url : null;
+}
+
+async function loadHistory() {
+    if (!supabaseClient || !historyResults) return;
+
+    const { data, error } = await supabaseClient
+        .from('my_questions')
+        .select('id, question, answer, sources, created_at')
+        .eq('status', 'done')
+        .order('created_at', { ascending: false })
+        .limit(50);
+
+    if (error) {
+        historyResults.innerHTML = `<div class="result-error">Could not load history: ${escapeHtml(error.message)}</div>`;
+        return;
+    }
+    if (!data.length) {
+        historyResults.innerHTML = '<div class="no-results">No questions yet. Ask one above!</div>';
+        return;
+    }
+
+    historyResults.innerHTML = data.map(row => {
+        const sources = (row.sources || []).map(src => {
+            const url = safeTalkUrl(src.url);
+            const title = escapeHtml(src.title || 'Untitled') + (src.conference ? ` (${escapeHtml(src.conference)})` : '');
+            return url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener">${title}</a>` : title;
+        }).join(' · ');
+        return `<div class="result-card">
+            <div class="result-card-header">
+                <div class="result-title">${escapeHtml(row.question)}</div>
+                <button class="btn-primary history-delete" data-id="${escapeHtml(row.id)}">Delete</button>
+            </div>
+            <div class="result-speaker">${escapeHtml(new Date(row.created_at).toLocaleString())}</div>
+            <div class="result-sentences">${escapeHtml(row.answer || '')}</div>
+            ${sources ? `<div class="result-speaker">Sources: ${sources}</div>` : ''}
+        </div>`;
+    }).join('');
+}
+
+// One listener for all delete buttons (no inline onclick, which the CSP blocks).
+if (historyResults) historyResults.addEventListener('click', async (e) => {
+    const btn = e.target.closest('.history-delete');
+    if (!btn) return;
+    const { error } = await supabaseClient.from('my_questions').delete().eq('id', btn.dataset.id);
+    if (error) alert(`Delete failed: ${error.message}`);
+    loadHistory();
+});
+if (historyRefreshBtn) historyRefreshBtn.addEventListener('click', loadHistory);
 
 // ============================================
 // PAGE VIEW COUNTER
