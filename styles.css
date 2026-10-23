@@ -768,3 +768,10 @@ input:focus {
     opacity: 0.7;
     font-style: italic;
 }
+
+.result-why {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin: 0.4rem 0;
+}

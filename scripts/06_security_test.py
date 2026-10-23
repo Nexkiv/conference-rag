@@ -71,6 +71,8 @@ def main():
               denied(lambda: anon.table('sentence_embeddings').select('text').limit(1).execute()))
         check("anon cannot call match_sentences",
               denied(lambda: anon.rpc('match_sentences', {'query_embedding': [0.0] * 1536}).execute()))
+        check("anon cannot call smart_search",
+              denied(lambda: anon.rpc('smart_search', {'q': 'faith', 'query_embedding': [0.0] * 1536}).execute()))
         check("anon cannot read my_questions",
               denied(lambda: anon.table('my_questions').select('*').execute()))
         check("anon cannot insert into page_views directly",
@@ -90,6 +92,9 @@ def main():
         hits = client_a.rpc('match_sentences', {'query_embedding': [0.01] * 1536, 'match_count': 999}).execute().data
         check("match_sentences caps results at 50", len(hits) <= 50, f"{len(hits)} rows")
         check("match_sentences never returns embeddings", all('embedding' not in h for h in hits))
+        smart = client_a.rpc('smart_search', {'q': 'faith', 'query_embedding': [0.01] * 1536, 'max_talks': 999}).execute().data
+        check("smart_search caps results at 20 talks", len(smart) <= 20, f"{len(smart)} talks")
+        check("smart_search never returns embeddings", all('embedding' not in h for h in smart))
 
         print("--- Edge Functions")
         r = call_function('embed-question', {'question': 'faith'})

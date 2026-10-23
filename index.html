@@ -121,6 +121,22 @@
                     <div class="search-results" id="semantic-results"></div>
                 </div>
 
+                <!-- Panel: Smart Search (hybrid) -->
+                <div class="search-panel" id="smart-panel">
+                    <div class="panel-header">
+                        <h3>✨ Smart Search</h3>
+                        <span class="status-badge not-ready" id="smart-status">🔴 Not Ready</span>
+                    </div>
+                    <p class="panel-description">Hybrid search: ranks talks by meaning and by the words you use, then
+                        combines both rankings (Reciprocal Rank Fusion) to find the talks closest to your intent.</p>
+                    <div class="panel-input">
+                        <input type="text" id="smart-input" maxlength="500" placeholder="Describe what you're looking for..."
+                            autocomplete="off" disabled />
+                        <button id="smart-btn" class="btn-primary" disabled>Search</button>
+                    </div>
+                    <div class="search-results" id="smart-results"></div>
+                </div>
+
                 <!-- Panel 3: RAG (Ask a Question) -->
                 <div class="search-panel" id="rag-panel">
                     <div class="panel-header">

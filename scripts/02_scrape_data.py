@@ -105,7 +105,8 @@ def scrape_talk(talk_url, session):
     title = soup.find("h1").text.strip() if soup.find("h1") else "No Title"
 
     speaker_tag = soup.find("p", {"class": "author-name"})
-    speaker = speaker_tag.text.strip() if speaker_tag else "Unknown"
+    # Names come as "By Elder X\u00a0Y": drop "By " and non-breaking spaces.
+    speaker = re.sub(r"^By\s+", "", speaker_tag.text.replace("\u00a0", " ").strip()) if speaker_tag else "Unknown"
 
     calling_tag = soup.find("p", {"class": "author-role"})
     calling = calling_tag.text.strip() if calling_tag else ""

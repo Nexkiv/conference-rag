@@ -303,6 +303,132 @@ $$;
 REVOKE ALL ON FUNCTION public.keyword_search(text, int) FROM public, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.keyword_search(text, int) TO authenticated;
 
+-- Full-text index for smart_search's keyword side. An expression index
+-- (instead of a stored tsvector column) avoids rewriting the table and
+-- rebuilding the HNSW index.
+CREATE INDEX IF NOT EXISTS sentence_embeddings_fts_idx
+ON public.sentence_embeddings USING gin (to_tsvector('english', text));
+
+-- ============================================
+-- smart_search: hybrid keyword + semantic (Reciprocal Rank Fusion)
+-- ============================================
+-- Ranks talks two ways, then fuses the RANKS (not the scores, whose scales
+-- differ):  score = 1/(60 + semantic_rank) + 1/(60 + keyword_rank)
+-- A talk both methods like wins; a talk only one finds still appears, lower.
+-- 60 is the standard RRF constant; it keeps rank #1 from dominating.
+--   semantic: top 100 sentences by HNSW, talks ranked by sum(similarity)/sqrt(length)
+--   keyword:  Postgres full-text search (stemmed, stop words dropped, ANY
+--             meaningful word counts), talks ranked by
+--             (sum of sentence ts_rank + 5 * title ts_rank) / sqrt(length)
+--             so natural-language questions still get a keyword signal.
+--             The Keyword panel keeps exact whole-word keyword_search().
+-- Same guards as match_sentences (SECURITY DEFINER to read the hidden vectors).
+DROP FUNCTION IF EXISTS public.smart_search(text, extensions.halfvec, int);
+CREATE FUNCTION public.smart_search(
+    q text,
+    query_embedding extensions.halfvec({DIMENSIONS}),
+    max_talks int DEFAULT 10
+)
+RETURNS TABLE (
+    talk_id uuid,
+    title text,
+    speaker text,
+    url text,
+    year int,
+    season text,
+    score float,
+    semantic_rank int,
+    keyword_rank int,
+    best_similarity float,
+    keyword_hits int,
+    title_match boolean,
+    snippets text[]
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions
+AS $$
+#variable_conflict use_column
+BEGIN
+    IF (SELECT auth.role()) IS DISTINCT FROM 'authenticated' THEN
+        RAISE EXCEPTION 'login required' USING ERRCODE = '42501';
+    END IF;
+    PERFORM set_config('hnsw.ef_search', '100', true);
+
+    RETURN QUERY
+    WITH sem_hits AS (
+        SELECT s.talk_id, s.text, 1 - (s.embedding <=> query_embedding) AS sim
+        FROM public.sentence_embeddings s
+        ORDER BY s.embedding <=> query_embedding
+        LIMIT 100
+    ),
+    sem AS (
+        SELECT h.talk_id,
+               sum(h.sim) / sqrt((SELECT count(*) FROM public.sentence_embeddings c
+                                  WHERE c.talk_id = h.talk_id)) AS sem_score,
+               max(h.sim) AS best_sim,
+               (array_agg(h.text ORDER BY h.sim DESC))[1:2] AS snips
+        FROM sem_hits h
+        GROUP BY h.talk_id
+    ),
+    sem_ranked AS (
+        SELECT sem.*, (rank() OVER (ORDER BY sem.sem_score DESC))::int AS r FROM sem
+    ),
+    tsq AS (
+        -- "find peace in hard times" -> 'find' | 'peac' | 'hard' | 'time'
+        SELECT CASE WHEN numnode(plainto_tsquery('english', q)) = 0 THEN NULL
+                    ELSE to_tsquery('english', replace(plainto_tsquery('english', q)::text, ' & ', ' | '))
+               END AS query
+    ),
+    fts_hits AS (
+        SELECT s.talk_id, s.text, ts_rank(to_tsvector('english', s.text), tsq.query) AS rk
+        FROM public.sentence_embeddings s, tsq
+        WHERE tsq.query IS NOT NULL
+          AND to_tsvector('english', s.text) @@ tsq.query    -- uses sentence_embeddings_fts_idx
+    ),
+    kw AS (
+        SELECT h.talk_id,
+               (sum(h.rk) + 5 * ts_rank(to_tsvector('english', t.title), tsq.query)) / sqrt(t.n) AS kw_score,
+               count(*)::int AS hits,
+               to_tsvector('english', t.title) @@ tsq.query AS tm,
+               (array_agg(h.text ORDER BY h.rk DESC))[1:2] AS snips
+        FROM fts_hits h
+        CROSS JOIN tsq
+        CROSS JOIN LATERAL (
+            SELECT min(c.title) AS title, count(*) AS n
+            FROM public.sentence_embeddings c WHERE c.talk_id = h.talk_id
+        ) t
+        GROUP BY h.talk_id, tsq.query, t.title, t.n
+        ORDER BY kw_score DESC
+        LIMIT 50
+    ),
+    kw_ranked AS (
+        SELECT kw.*, (rank() OVER (ORDER BY kw.kw_score DESC))::int AS r FROM kw
+    ),
+    fused AS (
+        SELECT coalesce(s.talk_id, k.talk_id) AS tid,
+               coalesce(1.0 / (60 + s.r), 0) + coalesce(1.0 / (60 + k.r), 0) AS rrf,
+               s.r AS sr, k.r AS kr, s.best_sim, k.hits, k.tm,
+               coalesce(s.snips, '{{}}'::text[]) || coalesce(k.snips, '{{}}'::text[]) AS snips
+        FROM sem_ranked s
+        FULL OUTER JOIN kw_ranked k ON k.talk_id = s.talk_id
+        ORDER BY rrf DESC
+        LIMIT least(greatest(max_talks, 1), 20)
+    )
+    SELECT f.tid, t.title, t.speaker, t.url, t.year, t.season,
+           f.rrf::float, f.sr, f.kr, f.best_sim::float, coalesce(f.hits, 0), coalesce(f.tm, false),
+           f.snips[1:3]
+    FROM fused f
+    CROSS JOIN LATERAL (
+        SELECT s.title, s.speaker, s.url, s.year, s.season
+        FROM public.sentence_embeddings s WHERE s.talk_id = f.tid LIMIT 1
+    ) t
+    ORDER BY f.rrf DESC;
+END;
+$$;
+REVOKE ALL ON FUNCTION public.smart_search(text, extensions.halfvec, int) FROM public, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.smart_search(text, extensions.halfvec, int) TO authenticated;
+
 NOTIFY pgrst, 'reload schema';
 """
 

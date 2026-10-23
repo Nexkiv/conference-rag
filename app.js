@@ -79,6 +79,8 @@ const semanticBtn = document.getElementById('semantic-btn');
 const semanticResults = document.getElementById('semantic-results');
 const semanticStatus = document.getElementById('semantic-status');
 
+const smartInput = document.getElementById('smart-input');
+const smartBtn = document.getElementById('smart-btn');
 const ragInput = document.getElementById('rag-input');
 const ragBtn = document.getElementById('rag-btn');
 const ragResults = document.getElementById('rag-results');
@@ -344,6 +346,7 @@ async function checkSearchReadiness() {
             }
         }
         setSearchReady('semantic', semanticReady);
+        setSearchReady('smart', semanticReady);
 
         // --- 1 generate-answer call (only if semantic pipeline is ready) ---
         if (!semanticReady) {
@@ -362,6 +365,7 @@ async function checkSearchReadiness() {
         console.log('Readiness check failed:', err.message);
         setSearchReady('keyword', false);
         setSearchReady('semantic', false);
+        setSearchReady('smart', false);
         setSearchReady('rag', false);
     } finally {
         readinessCheckRunning = false;
@@ -520,6 +524,57 @@ async function semanticSearch() {
 
     } catch (error) {
         showResults('semantic', `<div class="result-error">Error: ${escapeHtml(error.message)}</div>`);
+    } finally {
+        showLoading(false);
+    }
+}
+
+// ============================================
+// SMART SEARCH (hybrid keyword + semantic)
+// ============================================
+// smart_search() ranks talks by meaning (vector search) and by words
+// (full-text search), then fuses the two RANKS with Reciprocal Rank Fusion:
+// score = 1/(60 + semantic rank) + 1/(60 + keyword rank).
+
+async function smartSearch() {
+    const query = smartInput ? smartInput.value.trim() : '';
+    if (!query || !supabaseClient) return;
+
+    showLoading(true);
+    clearResults('smart');
+
+    try {
+        const embedding = await getEmbedding(query);
+        const { data, error } = await supabaseClient.rpc('smart_search', {
+            q: query,
+            query_embedding: embedding,
+            max_talks: 10
+        });
+        if (error) throw new Error(`Smart search failed: ${error.message}`);
+
+        if (!data || data.length === 0) {
+            showResults('smart', '<div class="no-results">No matching talks found. Try different words.</div>');
+            return;
+        }
+
+        let html = '';
+        for (const talk of data) {
+            const why = [
+                talk.semantic_rank ? `Meaning #${talk.semantic_rank} (${Math.round(talk.best_similarity * 100)}%)` : null,
+                talk.keyword_rank ? `Words #${talk.keyword_rank} (${talk.keyword_hits} sentence${talk.keyword_hits === 1 ? '' : 's'})` : null,
+                talk.title_match ? 'Title match' : null
+            ].filter(Boolean).map(t => `<span class="similarity-badge similarity-mid">${escapeHtml(t)}</span>`).join(' ');
+            html += `<div class="result-card">
+                <div class="result-title"><a href="${escapeHtml(talk.url)}" target="_blank" class="result-title-link">${escapeHtml(talk.title)}</a></div>
+                <div class="result-speaker">${speakerLine({ ...talk, conference: conferenceLabel(talk) })}</div>
+                <div class="result-why">${why}</div>
+                <div class="result-sentences">${(talk.snippets || []).map(escapeHtml).join('<br>')}</div>
+            </div>`;
+        }
+        showResults('smart', html);
+
+    } catch (error) {
+        showResults('smart', `<div class="result-error">Error: ${escapeHtml(error.message)}</div>`);
     } finally {
         showLoading(false);
     }
@@ -763,6 +818,10 @@ if (keywordInput) keywordInput.addEventListener('keypress', (e) => {
 });
 
 // Semantic search
+if (smartBtn) smartBtn.addEventListener('click', smartSearch);
+if (smartInput) smartInput.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') smartSearch();
+});
 if (semanticBtn) semanticBtn.addEventListener('click', semanticSearch);
 if (semanticInput) semanticInput.addEventListener('keypress', (e) => {
     if (e.key === 'Enter') semanticSearch();
