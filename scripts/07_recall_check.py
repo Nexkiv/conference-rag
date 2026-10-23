@@ -8,15 +8,9 @@ duplicate sentences don't count as misses.
 Usage:
     python scripts/07_recall_check.py
 """
-import importlib.util
-import sys
-
 from openai import OpenAI
 
-spec = importlib.util.spec_from_file_location('schema', 'scripts/01_create_schema.py')
-schema = importlib.util.module_from_spec(spec)
-sys.argv = sys.argv[:1]
-spec.loader.exec_module(schema)
+from supabase_admin import DIMENSIONS, EF_SEARCH, EMBED_MODEL, run_sql
 
 QUESTIONS = [
     "How can I find peace during hard times?",
@@ -32,19 +26,20 @@ QUESTIONS = [
 ]
 K = 20
 
-vectors = OpenAI().embeddings.create(model='text-embedding-3-small', input=QUESTIONS, dimensions=1536).data
+vectors = OpenAI().embeddings.create(model=EMBED_MODEL, input=QUESTIONS, dimensions=DIMENSIONS).data
 
 
 def top_scores(vec, exact):
     literal = '[' + ','.join(f'{x:.7f}' for x in vec) + ']'
-    setting = "set_config('enable_indexscan', 'off', true)" if exact else "set_config('hnsw.ef_search', '100', true)"
-    rows = schema.run_sql(f"""begin;
+    setting = "set_config('enable_indexscan', 'off', true)" if exact else f"set_config('hnsw.ef_search', '{EF_SEARCH}', true)"
+    # The Management API returns only the last statement's rows, hence the temp table.
+    rows = run_sql(f"""begin;
 select {setting};
 create temp table r as
-select 1 - (embedding <=> '{literal}'::extensions.halfvec(1536)) as sim
-from public.sentence_embeddings order by embedding <=> '{literal}'::extensions.halfvec(1536) limit {K};
+select 1 - (embedding <=> '{literal}'::extensions.halfvec({DIMENSIONS})) as sim
+from public.sentence_embeddings order by embedding <=> '{literal}'::extensions.halfvec({DIMENSIONS}) limit {K};
 select sim from r order by sim desc;""")
-    schema.run_sql("rollback; select 1")
+    run_sql("rollback; select 1")
     return [r['sim'] for r in rows]
 
 

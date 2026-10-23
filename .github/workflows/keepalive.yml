@@ -30,8 +30,9 @@ jobs:
             exit 0
           fi
           # Public read with the publishable key (already public in config.public.json).
-          url=$(jq -r .SUPABASE_URL < <(curl -sf "https://nexkiv.github.io/conference-rag/config.public.json"))
-          key=$(jq -r .SUPABASE_PUBLISHABLE_KEY < <(curl -sf "https://nexkiv.github.io/conference-rag/config.public.json"))
+          cfg=$(curl -sf "https://nexkiv.github.io/conference-rag/config.public.json" || true)
+          url=$(jq -r .SUPABASE_URL <<< "$cfg")
+          key=$(jq -r .SUPABASE_PUBLISHABLE_KEY <<< "$cfg")
           code=$(curl -s -o /dev/null -w '%{http_code}' "$url/rest/v1/page_views?select=id&limit=1" -H "apikey: $key")
           echo "Pinged page_views: HTTP $code (on until $UNTIL)"
           [ "$code" = "200" ]

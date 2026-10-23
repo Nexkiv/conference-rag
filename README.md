@@ -11,46 +11,54 @@ Built on the course starter. What's different:
 | Area | Change |
 |---|---|
 | Data | Talks from 2020–2026 (14 conferences, 501 talks, 30,102 sentences); every listing shows its conference, e.g. "October 2025" |
-| Vectors | `text-embedding-3-small` at full 1536 dims stored as `halfvec(1536)` (2-byte floats) + HNSW index: half the size of `vector(1536)`, so data + index fit the 500 MB free tier |
+| Vectors | `text-embedding-3-small` at full 1536 dims stored as `halfvec(1536)` (2-byte floats) + HNSW index: half the size of `vector(1536)`, so data + index fit the 500 MB free tier. HNSW recall@20 vs exact search: **0.99** (`07_recall_check.py`) |
 | Keyword search | `keyword_search()`: whole-word, case-insensitive; talks ranked by (matching sentences + 5 × title match) / √(talk length) |
-| RAG ranking | Talks ranked by Σ similarity / √(talk length) instead of average similarity |
-| **Feature: My Questions** | Private per-user history of RAG questions, answers and cited talks, with delete. RLS: `user_id = auth.uid()` for SELECT/DELETE; no INSERT/UPDATE policy, so only the Edge Function writes rows |
-| Abuse limits | 20 RAG questions per user per hour (pending row written before the GPT call; fails closed), 500-character questions, ~12K-token context |
-| Secrets | Environment variables only; no `config.secret.json` |
+| **Smart Search** | `smart_search()`: semantic (Σ similarity / √length) and full-text (stemmed, any meaningful word, title weighted) talk rankings fused with Reciprocal Rank Fusion (k = 60) |
+| RAG | The `generate-answer` Edge Function retrieves the 3 talks itself with Smart Search, sends their full text to GPT-4o, and returns the answer **and** the sources it used; the browser only sends the question |
+| **Feature: My Questions** | Private per-user history of RAG questions, answers and cited talks. Users can only read and hide their own rows; only the server writes them |
+| Abuse limits | 20 RAG questions per user per hour, checked and recorded atomically in `claim_question()` (per-user lock) before any OpenAI call; hiding history doesn't reset it; 500-character questions; ~12K-token context |
+| Secrets | Environment variables only; no `config.secret.json` (steps 01–02's `config.secret.json` instructions don't apply to this fork) |
 
 ### Setup differences
 - `config.public.json` holds the Supabase URL and the **publishable** key (`sb_publishable_…`); legacy anon/service_role keys are disabled.
-- Scripts read `SUPABASE_SERVICE_KEY` (a `sb_secret_…` key), `SUPABASE_ACCESS_TOKEN` and `OPENAI_API_KEY` from the environment.
+- Scripts read `SUPABASE_SERVICE_KEY` (a `sb_secret_…` key), `SUPABASE_ACCESS_TOKEN` and `OPENAI_API_KEY` from the environment; shared settings (model, dimensions, `ef_search`, length limits) live in `scripts/supabase_admin.py`.
 - Edge Functions: `supabase secrets set OPENAI_API_KEY="$OPENAI_API_KEY"`; they read the secret key from Supabase's built-in `SUPABASE_SECRET_KEYS`.
-- After `05_update_embeddings.py`, build the index with `scripts/01_create_schema.py --index`. The Management API cancels statements after 2 minutes, so on the free tier schedule the build once with `pg_cron` instead (see the script).
-- `scripts/06_security_test.py` checks every access rule with two throwaway users.
+- After `05_update_embeddings.py`, build the index with `scripts/01_create_schema.py --index`. The build takes ~2 minutes and the Management API cancels statements after 2 minutes, so the script runs it as a one-off `pg_cron` job and waits for it.
+- `scripts/06_security_test.py` checks every access rule and the search behavior with throwaway users (`--rag` adds a real RAG call, `--burst` 25 parallel questions to prove the rate limit holds).
 
 ### Access control
 
 | Layer | What it protects |
 |---|---|
-| Table privileges (GRANT/REVOKE) | anon can't touch `sentence_embeddings` or `my_questions` at all |
+| Table privileges (GRANT/REVOKE) | anon can't touch `sentence_embeddings` or `my_questions` at all; logged-in users can only SELECT `my_questions` |
 | Column privileges | Logged-in users can read every `sentence_embeddings` column **except `embedding`** (vectors are ~97% of the bytes, so nobody can bulk-download them) |
-| RLS | `my_questions`: only your own rows; `page_views`: public read |
-| `match_sentences()` | SECURITY DEFINER so it can read the hidden vectors; checks login itself, anon can't EXECUTE, pinned `search_path`, returns ≤ 50 rows and never the vector. ⚠ RLS does not apply inside it: if this table ever holds per-user rows, it must filter by `auth.uid()` itself |
-| `record_view()` | The only way to add a page view; caps the table at the newest 10,000 rows so anonymous visitors can't fill the database |
-| Edge Functions | Verify the login with Supabase Auth; the OpenAI key never leaves the server; generic errors to the browser, details in logs |
+| RLS | `my_questions`: only your own, non-hidden rows; `page_views`: public read |
+| `match_sentences()`, `smart_search()` | SECURITY DEFINER so they can read the hidden vectors; check login themselves, anon can't EXECUTE, pinned `search_path`, capped results, never return the vector. ⚠ RLS does not apply inside them: if this table ever holds per-user rows, they must filter by `auth.uid()` themselves |
+| `keyword_search()` | SECURITY INVOKER: runs as the caller, so grants and RLS apply; anon can't EXECUTE |
+| `hide_question()` | The only way to remove a question from history: hides it if it's yours, so the rate limit still counts it |
+| `claim_question()` | Server-only (service role): per-user lock, count, insert; returns nothing when over the limit |
+| `record_view()` | The only way to add a page view; keeps the last 30 days and at most 10,000 rows, so anonymous visitors can't fill the database (the page shows views in the last 30 days) |
+| Edge Functions | Verify the login with Supabase Auth; search as the user; the OpenAI key never leaves the server; generic errors to the browser, details in logs |
 | Browser | Strict CSP, pinned `supabase-js` with SRI, all output escaped. GitHub Pages can't send headers, so no `frame-ancestors` |
 
-**Known limitations:** `match_sentences` returns similarity scores for a caller-chosen vector, so many crafted queries could approximate some stored vectors (the content is public anyway). Keyword search scans every sentence; at millions of rows it needs a trigram or full-text index.
+**Known limitations:** `match_sentences` and `smart_search` return similarity scores for a caller-chosen vector, so many crafted queries could approximate some stored vectors (the content is public anyway). Keyword search scans every sentence; at millions of rows it needs a trigram or full-text index. Smart Search's `ts_rank` gives common words (e.g. "God") as much title credit as rare ones.
 
 ### Scaling notes
 - HNSW turns vector search from a full scan into a graph walk; `ef_search = 100`.
 - Edge Functions are stateless; GitHub Pages serves the site from a CDN.
 - Access rules live in the database, so every client path obeys them.
-- Per-user quotas live in the same table as the feature; at higher volume a shared rate limiter (e.g. Redis) would replace the count query.
+- Per-user quotas use a per-user advisory lock in Postgres; at higher volume a shared rate limiter (e.g. Redis) would replace it.
 - For RAG at scale, send matched passages instead of three full talks (~10K tokens, ~$0.03 per question today).
 
 ### Keep-alive switch
 Free projects pause after ~7 days idle. `.github/workflows/keepalive.yml` pings a public endpoint daily **only while** the repo variable `KEEPALIVE_UNTIL` (YYYY-MM-DD) is today or later. Turn it on with `gh variable set KEEPALIVE_UNTIL -b <date>`. If the project already paused, click Restore in the Supabase dashboard first (possible for ~90 days).
 
-### Experiments not done yet
-Local JWKS (ES256) verification in the Edge Functions · `pg_trgm` index for keyword search · a similarity gate that skips GPT for off-topic questions · HNSW recall vs exact search and Σ/√N vs Σ ranking (flagged for evaluation)
+### Next steps / experiments not done yet
+- A `talks` materialized view (one row per talk: metadata + sentence count, refreshed after import) instead of rebuilding talk data from sentences in every search function.
+- Local JWKS (ES256) verification in the Edge Functions instead of a round trip to Supabase Auth.
+- `pg_trgm` index for keyword search; BM25/IDF weighting so common words count less in Smart Search.
+- A similarity gate that skips GPT for off-topic questions.
+- Compare Σ/√N against plain Σ ranking on a set of test questions.
 
 ---
 
@@ -129,7 +137,7 @@ Your AI assistant will automatically read [`ai_agent_instructions.md`](ai_agent_
 ```
 conference-rag/
 ├── index.html                  # Main application UI
-├── app.js                      # Three search modes + auth logic
+├── app.js                      # Keyword, semantic, smart search, RAG, My Questions + auth
 ├── styles.css                  # Dark theme styling
 ├── config.js                   # Loads config.public.json for browser
 ├── config.public.json          # Supabase URL + publishable key (safe to commit)
@@ -145,11 +153,13 @@ conference-rag/
 │   ├── 03_import_data.py       # Import text to Supabase (🔍 keyword!)
 │   ├── 04_embed_data.py        # Generate embeddings → scripts/output/ (💰 saved to disk!)
 │   ├── 05_update_embeddings.py # Update DB with embeddings (🧠 semantic!)
-│   ├── 06_security_test.py     # Access-control checks with two throwaway users
+│   ├── 06_security_test.py     # Access-control + search-behavior checks with throwaway users
+│   ├── 07_recall_check.py      # HNSW recall@20 vs exact search
+│   ├── supabase_admin.py       # Shared settings + Management API helper
 │   └── output/                 # Intermediate data files (git-ignored)
 └── supabase/                   # Edge Functions (YOU create this with supabase init)
     └── functions/
-        ├── _shared/            # Shared auth & CORS helpers
+        ├── _shared/            # Shared auth, CORS/JSON, validation & OpenAI helpers
         ├── embed-question/     # Converts questions to embeddings
         └── generate-answer/    # Generates AI answers
 ```

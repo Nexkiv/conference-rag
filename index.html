@@ -10,13 +10,14 @@
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; connect-src 'self' https://xbvnczcyxtiusbxhajdc.supabase.co; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
     <title>Supabase RAG - Conference Q&A</title>
     <!-- ?v=... busts the browser cache (Pages caches files for 10 min): bump it when app.js, config.js or styles.css change. -->
-    <link rel="stylesheet" href="styles.css?v=20261022c">
+    <link rel="stylesheet" href="styles.css?v=20261022d">
 </head>
 
 <body>
     <div id="deploy-info" class="deploy-info">
         Updated: <span id="deploy-date">...</span>
-        &nbsp;·&nbsp; Views: <span id="page-views-count">...</span>
+        &nbsp;·&nbsp; <span title="Visits in the last 30 days (counts at most the 10,000 most recent)">Views (last 30 days):
+            <span id="page-views-count">...</span></span>
     </div>
 
     <!-- Setup Banner (shows when configuration is incomplete) -->
@@ -179,10 +180,10 @@
         crossorigin="anonymous"></script>
 
     <!-- Configuration (Students will replace this) -->
-    <script src="config.js?v=20261022c"></script>
+    <script src="config.js?v=20261022d"></script>
 
     <!-- Main Application Logic -->
-    <script src="app.js?v=20261022c"></script>
+    <script src="app.js?v=20261022d"></script>
 </body>
 
 </html>

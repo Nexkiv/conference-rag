@@ -27,15 +27,14 @@ import sys
 import time
 
 from openai import OpenAI
+
+from supabase_admin import DIMENSIONS, EMBED_MODEL  # shared with the schema and Edge Functions
 from tqdm import tqdm
 
 
 INPUT_FILE = os.path.join('scripts', 'output', 'sentences.json')
 OUTPUT_FILE = os.path.join('scripts', 'output', 'sentences_with_embeddings.json')
 BATCH_SIZE = 100
-# Full size for text-embedding-3-small. Stored as halfvec(1536) in the DB.
-# embed-question must ask for the same size.
-DIMENSIONS = 1536
 
 
 def main():
@@ -50,7 +49,7 @@ def main():
     print("=" * 60)
     print(f"Generating Embeddings for {len(records):,} Sentences")
     print("=" * 60)
-    print(f"   Model: text-embedding-3-small (1,536 dimensions)")
+    print(f"   Model: {EMBED_MODEL} ({DIMENSIONS:,} dimensions)")
     print(f"   Batch size: {BATCH_SIZE}\n")
 
     # Check if there's a partial result we can resume from
@@ -81,7 +80,7 @@ def main():
 
         try:
             response = client.embeddings.create(
-                model='text-embedding-3-small',
+                model=EMBED_MODEL,
                 input=batch_texts,
                 dimensions=DIMENSIONS
             )

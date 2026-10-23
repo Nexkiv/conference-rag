@@ -13,26 +13,22 @@ Prerequisites:
     - SUPABASE_ACCESS_TOKEN and SUPABASE_SERVICE_KEY environment variables
 """
 
-import json
 import os
 import sys
 import time
 
-import requests
+from supabase_admin import (DIMENSIONS, EF_SEARCH, MAX_PAGE_FIELD_CHARS, MAX_QUESTION_CHARS,
+                            SUPABASE_URL, run_sql)
 
-with open('config.public.json', 'r') as f:
-    public_config = json.load(f)
-
-SUPABASE_URL = public_config['SUPABASE_URL']
-SUPABASE_PROJECT_REF = SUPABASE_URL.split('//')[1].split('.')[0]
-# Secrets come from environment variables only, never from a file.
-SUPABASE_SERVICE_KEY = os.environ['SUPABASE_SERVICE_KEY']
-SUPABASE_ACCESS_TOKEN = os.environ['SUPABASE_ACCESS_TOKEN']
-
-# Must match DIMENSIONS in 04_embed_data.py and the embed-question Edge Function.
-# halfvec stores each number in 2 bytes instead of 4: full 1536 dimensions at half
-# the size, so the table + HNSW index fit the 500 MB free tier with room to spare.
-DIMENSIONS = 1536
+# The login check shared by the SECURITY DEFINER search functions.
+REQUIRE_LOGIN = """
+    IF (SELECT auth.role()) IS DISTINCT FROM 'authenticated' THEN
+        RAISE EXCEPTION 'login required' USING ERRCODE = '42501';
+    END IF;
+    -- HNSW candidates per search. Set here, for this transaction only:
+    -- Supabase's postgres role may not attach it to the function definition.
+    PERFORM set_config('hnsw.ef_search', '{ef}', true);
+""".format(ef=EF_SEARCH)
 
 SCHEMA_SQL = f"""
 CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions;
@@ -57,6 +53,12 @@ CREATE TABLE IF NOT EXISTS public.sentence_embeddings (
 
 CREATE INDEX IF NOT EXISTS sentence_embeddings_talk_id_idx
 ON public.sentence_embeddings(talk_id);
+
+-- Full-text index for smart_search's keyword side. An expression index
+-- (instead of a stored tsvector column) avoids rewriting the table and
+-- rebuilding the HNSW index.
+CREATE INDEX IF NOT EXISTS sentence_embeddings_fts_idx
+ON public.sentence_embeddings USING gin (to_tsvector('english', text));
 
 ALTER TABLE public.sentence_embeddings ENABLE ROW LEVEL SECURITY;
 
@@ -87,7 +89,7 @@ CREATE TABLE IF NOT EXISTS public.page_views (
 
 ALTER TABLE public.page_views DROP CONSTRAINT IF EXISTS page_views_lengths;
 ALTER TABLE public.page_views ADD CONSTRAINT page_views_lengths
-    CHECK (length(page_url) <= 500 AND length(user_agent) <= 500);
+    CHECK (length(page_url) <= {MAX_PAGE_FIELD_CHARS} AND length(user_agent) <= {MAX_PAGE_FIELD_CHARS});
 CREATE INDEX IF NOT EXISTS page_views_visited_at_idx ON public.page_views(visited_at);
 
 ALTER TABLE public.page_views ENABLE ROW LEVEL SECURITY;
@@ -105,6 +107,9 @@ DROP POLICY IF EXISTS "Allow public inserts" ON public.page_views;
 REVOKE ALL ON public.page_views FROM anon, authenticated;
 GRANT SELECT ON public.page_views TO anon, authenticated;
 
+-- Records a visit, then prunes: rows older than 30 days go (the page shows
+-- "views in the last 30 days"), and at most the newest 10,000 stay (so a
+-- reload loop can't fill the database).
 CREATE OR REPLACE FUNCTION public.record_view(p_url text)
 RETURNS void
 LANGUAGE plpgsql
@@ -113,9 +118,9 @@ SET search_path = public
 AS $$
 BEGIN
     INSERT INTO public.page_views (page_url, user_agent)
-    VALUES (left(p_url, 500),
-            left(current_setting('request.headers', true)::json ->> 'user-agent', 500));
-    -- Keep only the newest 10,000 rows.
+    VALUES (left(p_url, {MAX_PAGE_FIELD_CHARS}),
+            left(current_setting('request.headers', true)::json ->> 'user-agent', {MAX_PAGE_FIELD_CHARS}));
+    DELETE FROM public.page_views WHERE visited_at < now() - interval '30 days';
     DELETE FROM public.page_views
     WHERE id IN (SELECT id FROM public.page_views ORDER BY visited_at DESC OFFSET 10000);
 END;
@@ -129,13 +134,19 @@ GRANT EXECUTE ON FUNCTION public.record_view(text) TO anon, authenticated;
 CREATE TABLE IF NOT EXISTS public.my_questions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-    question TEXT NOT NULL CHECK (length(question) <= 500),
+    question TEXT NOT NULL CHECK (length(question) <= {MAX_QUESTION_CHARS}),
     answer TEXT,
     -- Snapshot of what was cited, so history survives a re-import of talks.
     sources JSONB NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'done', 'error')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- "Deleting" a question hides it: the row stays so the hourly limit still
+-- counts it (otherwise deleting history would reset the limit).
+ALTER TABLE public.my_questions ADD COLUMN IF NOT EXISTS hidden_at TIMESTAMPTZ;
+ALTER TABLE public.my_questions DROP CONSTRAINT IF EXISTS my_questions_question_check;
+ALTER TABLE public.my_questions ADD CONSTRAINT my_questions_question_check
+    CHECK (length(question) <= {MAX_QUESTION_CHARS});
 
 -- Serves both the history list and the hourly rate-limit count.
 CREATE INDEX IF NOT EXISTS my_questions_user_created_idx
@@ -143,23 +154,66 @@ ON public.my_questions(user_id, created_at DESC);
 
 ALTER TABLE public.my_questions ENABLE ROW LEVEL SECURITY;
 
--- Users can read and delete only their own rows. There is no INSERT or
--- UPDATE policy: only the generate-answer Edge Function writes history, with
--- user_id taken from the verified login token.
+-- Users can read only their own visible rows. There is no INSERT, UPDATE or
+-- DELETE policy: claim_question() (called by the generate-answer Edge
+-- Function, user_id from the verified login token) creates rows, and
+-- hide_question() hides them.
 DROP POLICY IF EXISTS "Read own questions" ON public.my_questions;
 CREATE POLICY "Read own questions"
 ON public.my_questions FOR SELECT
 TO authenticated
-USING (user_id = (SELECT auth.uid()));
+USING (user_id = (SELECT auth.uid()) AND hidden_at IS NULL);
 
 DROP POLICY IF EXISTS "Delete own questions" ON public.my_questions;
-CREATE POLICY "Delete own questions"
-ON public.my_questions FOR DELETE
-TO authenticated
-USING (user_id = (SELECT auth.uid()));
-
 REVOKE ALL ON public.my_questions FROM anon, authenticated;
-GRANT SELECT, DELETE ON public.my_questions TO authenticated;
+GRANT SELECT ON public.my_questions TO authenticated;
+
+-- Hides one of the caller's own questions. Returns false if the row isn't
+-- theirs (or is already hidden), so nobody can hide someone else's history.
+CREATE OR REPLACE FUNCTION public.hide_question(p_id uuid)
+RETURNS boolean
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    WITH hidden AS (
+        UPDATE public.my_questions SET hidden_at = now()
+        WHERE id = p_id AND user_id = (SELECT auth.uid()) AND hidden_at IS NULL
+        RETURNING 1
+    )
+    SELECT count(*) > 0 FROM hidden;
+$$;
+REVOKE ALL ON FUNCTION public.hide_question(uuid) FROM public, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.hide_question(uuid) TO authenticated;
+
+-- Rate limit + pending history row in one transaction. The per-user advisory
+-- lock makes one user's parallel requests take turns, so a burst can't all
+-- read "under the limit" before any of them inserts. Hidden rows still count.
+-- Returns the new row id, or NULL when the user is over the limit.
+-- Server only: user_id comes from the Edge Function's verified token.
+DROP FUNCTION IF EXISTS public.claim_question(uuid, text, int);
+CREATE FUNCTION public.claim_question(p_user uuid, p_question text, p_limit int)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    new_id uuid;
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtext(p_user::text));
+    IF (SELECT count(*) FROM public.my_questions
+        WHERE user_id = p_user AND created_at > now() - interval '1 hour') >= p_limit THEN
+        RETURN NULL;
+    END IF;
+    INSERT INTO public.my_questions (user_id, question)
+    VALUES (p_user, p_question)
+    RETURNING id INTO new_id;
+    RETURN new_id;
+END;
+$$;
+REVOKE ALL ON FUNCTION public.claim_question(uuid, text, int) FROM public, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.claim_question(uuid, text, int) TO service_role;
 
 -- ============================================
 -- match_sentences: vector similarity search
@@ -188,8 +242,7 @@ RETURNS TABLE (
     year int,
     season text,
     text text,
-    similarity float,
-    talk_sentences int
+    similarity float
 )
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -197,28 +250,13 @@ SET search_path = public, extensions
 AS $$
 #variable_conflict use_column
 BEGIN
-    IF (SELECT auth.role()) IS DISTINCT FROM 'authenticated' THEN
-        RAISE EXCEPTION 'login required' USING ERRCODE = '42501';
-    END IF;
-
-    -- HNSW looks at 100 candidates per search (default 40) for better recall.
-    -- Set here, for this transaction only: Supabase's postgres role may not
-    -- attach this setting to the function definition itself.
-    PERFORM set_config('hnsw.ef_search', '100', true);
-
+{REQUIRE_LOGIN}
     RETURN QUERY
-    WITH hits AS (
-        SELECT s.id, s.talk_id, s.title, s.speaker, s.url, s.year, s.season, s.text,
-               1 - (s.embedding <=> query_embedding) AS similarity
-        FROM public.sentence_embeddings s
-        ORDER BY s.embedding <=> query_embedding
-        LIMIT least(greatest(match_count, 1), 50)
-    )
-    SELECT h.id, h.talk_id, h.title, h.speaker, h.url, h.year, h.season, h.text, h.similarity::float,
-           -- Talk length, so the browser can rank talks by sum / sqrt(length).
-           (SELECT count(*)::int FROM public.sentence_embeddings c WHERE c.talk_id = h.talk_id)
-    FROM hits h
-    ORDER BY h.similarity DESC;
+    SELECT s.id, s.talk_id, s.title, s.speaker, s.url, s.year, s.season, s.text,
+           (1 - (s.embedding <=> query_embedding))::float AS similarity
+    FROM public.sentence_embeddings s
+    ORDER BY s.embedding <=> query_embedding
+    LIMIT least(greatest(match_count, 1), 50);
 END;
 $$;
 REVOKE ALL ON FUNCTION public.match_sentences(extensions.halfvec, int) FROM public, anon, authenticated;
@@ -231,15 +269,16 @@ GRANT EXECUTE ON FUNCTION public.match_sentences(extensions.halfvec, int) TO aut
 --     score = (matching sentences + 5 * title_match) / sqrt(talk sentences)
 -- so a title match is worth 5 extra mentions: it helps, but a talk that
 -- uses the words much more often can still outrank it. The sqrt keeps long
--- talks from winning on volume alone (same idea as the RAG ranking).
+-- talks from winning on volume alone.
 -- Returns up to 3 matching sentences per talk (or the opening sentence for a
 -- title-only match). SECURITY INVOKER: runs as the caller, so RLS and the
 -- column grants above still apply.
--- Matching is whole-word and case-insensitive: a regex ~* wrapped in the
--- word-boundary escapes m and M (start/end of word), so "the" no longer matches "strengthen". Every
--- character that isn't a letter, digit or space is escaped, so the query
--- matches literally. chr(92) is a backslash, written that way to keep
--- backslashes out of this Python string.
+-- Whole-word, case-insensitive: the query must not be glued to a letter or
+-- digit on either side (regex lookarounds), the same rule as the page's
+-- highlighter, so "the" doesn't match "strengthen" and "faith?" still works.
+-- Every character that isn't a letter, digit or space is escaped, so the
+-- query matches literally; runs of spaces become one. chr(92) is a
+-- backslash, written that way to keep backslashes out of this Python string.
 DROP FUNCTION IF EXISTS public.keyword_search(text, int);
 CREATE FUNCTION public.keyword_search(q text, max_talks int DEFAULT 10)
 RETURNS TABLE (
@@ -260,9 +299,11 @@ SECURITY INVOKER
 SET search_path = public
 AS $$
     WITH pat AS (
-        SELECT chr(92) || 'm'
-               || regexp_replace(trim(left(q, 500)), '([^[:alnum:][:space:]])', repeat(chr(92), 3) || '1', 'g')
-               || chr(92) || 'M' AS p
+        SELECT '(?<![[:alnum:]])'
+               || regexp_replace(
+                      regexp_replace(trim(left(q, {MAX_QUESTION_CHARS})), '[[:space:]]+', ' ', 'g'),
+                      '([^[:alnum:][:space:]])', repeat(chr(92), 3) || '1', 'g')
+               || '(?![[:alnum:]])' AS p
     ),
     matches AS (
         SELECT s.talk_id, s.sentence_num, s.text
@@ -303,12 +344,6 @@ $$;
 REVOKE ALL ON FUNCTION public.keyword_search(text, int) FROM public, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.keyword_search(text, int) TO authenticated;
 
--- Full-text index for smart_search's keyword side. An expression index
--- (instead of a stored tsvector column) avoids rewriting the table and
--- rebuilding the HNSW index.
-CREATE INDEX IF NOT EXISTS sentence_embeddings_fts_idx
-ON public.sentence_embeddings USING gin (to_tsvector('english', text));
-
 -- ============================================
 -- smart_search: hybrid keyword + semantic (Reciprocal Rank Fusion)
 -- ============================================
@@ -323,6 +358,7 @@ ON public.sentence_embeddings USING gin (to_tsvector('english', text));
 --             so natural-language questions still get a keyword signal.
 --             The Keyword panel keeps exact whole-word keyword_search().
 -- Same guards as match_sentences (SECURITY DEFINER to read the hidden vectors).
+-- Used by the Smart Search panel and by generate-answer to pick RAG talks.
 DROP FUNCTION IF EXISTS public.smart_search(text, extensions.halfvec, int);
 CREATE FUNCTION public.smart_search(
     q text,
@@ -350,11 +386,7 @@ SET search_path = public, extensions
 AS $$
 #variable_conflict use_column
 BEGIN
-    IF (SELECT auth.role()) IS DISTINCT FROM 'authenticated' THEN
-        RAISE EXCEPTION 'login required' USING ERRCODE = '42501';
-    END IF;
-    PERFORM set_config('hnsw.ef_search', '100', true);
-
+{REQUIRE_LOGIN}
     RETURN QUERY
     WITH sem_hits AS (
         SELECT s.talk_id, s.text, 1 - (s.embedding <=> query_embedding) AS sim
@@ -375,9 +407,11 @@ BEGIN
         SELECT sem.*, (rank() OVER (ORDER BY sem.sem_score DESC))::int AS r FROM sem
     ),
     tsq AS (
-        -- "find peace in hard times" -> 'find' | 'peac' | 'hard' | 'time'
+        -- "find peace in hard times" -> 'find' | 'peac' | 'hard' | 'time'.
+        -- Cast the text straight to tsquery: running the stems through
+        -- to_tsquery would stem them twice ('agre' -> 'agr') and miss.
         SELECT CASE WHEN numnode(plainto_tsquery('english', q)) = 0 THEN NULL
-                    ELSE to_tsquery('english', replace(plainto_tsquery('english', q)::text, ' & ', ' | '))
+                    ELSE replace(plainto_tsquery('english', q)::text, ' & ', ' | ')::tsquery
                END AS query
     ),
     fts_hits AS (
@@ -386,19 +420,26 @@ BEGIN
         WHERE tsq.query IS NOT NULL
           AND to_tsvector('english', s.text) @@ tsq.query    -- uses sentence_embeddings_fts_idx
     ),
-    kw AS (
-        SELECT h.talk_id,
-               (sum(h.rk) + 5 * ts_rank(to_tsvector('english', t.title), tsq.query)) / sqrt(t.n) AS kw_score,
-               count(*)::int AS hits,
-               to_tsvector('english', t.title) @@ tsq.query AS tm,
+    -- Group hits by talk first, so talk length is looked up once per talk,
+    -- not once per matching sentence.
+    kw_talks AS (
+        SELECT h.talk_id, sum(h.rk) AS rk_sum, count(*)::int AS hits,
                (array_agg(h.text ORDER BY h.rk DESC))[1:2] AS snips
         FROM fts_hits h
+        GROUP BY h.talk_id
+    ),
+    kw AS (
+        SELECT k.talk_id,
+               (k.rk_sum + 5 * ts_rank(to_tsvector('english', t.title), tsq.query)) / sqrt(t.n) AS kw_score,
+               k.hits,
+               to_tsvector('english', t.title) @@ tsq.query AS tm,
+               k.snips
+        FROM kw_talks k
         CROSS JOIN tsq
         CROSS JOIN LATERAL (
             SELECT min(c.title) AS title, count(*) AS n
-            FROM public.sentence_embeddings c WHERE c.talk_id = h.talk_id
+            FROM public.sentence_embeddings c WHERE c.talk_id = k.talk_id
         ) t
-        GROUP BY h.talk_id, tsq.query, t.title, t.n
         ORDER BY kw_score DESC
         LIMIT 50
     ),
@@ -417,7 +458,11 @@ BEGIN
     )
     SELECT f.tid, t.title, t.speaker, t.url, t.year, t.season,
            f.rrf::float, f.sr, f.kr, f.best_sim::float, coalesce(f.hits, 0), coalesce(f.tm, false),
-           f.snips[1:3]
+           -- A sentence can be top for both methods: show it once.
+           (ARRAY(SELECT d.x FROM (SELECT DISTINCT ON (u.x) u.x, u.i
+                                   FROM unnest(f.snips) WITH ORDINALITY u(x, i)
+                                   ORDER BY u.x, u.i) d
+                  ORDER BY d.i))[1:3]
     FROM fused f
     CROSS JOIN LATERAL (
         SELECT s.title, s.speaker, s.url, s.year, s.season
@@ -434,32 +479,20 @@ NOTIFY pgrst, 'reload schema';
 
 # Built after the embeddings are loaded: one bulk build is much faster than
 # updating the graph on every insert.
-# The free tier's shared memory can't hold a big parallel build ("could not
-# resize shared memory segment"), so build single-process. 200MB holds the
-# whole graph in memory, which keeps the build under the API's ~100 s timeout.
+# - The free tier's shared memory can't hold a parallel build ("could not
+#   resize shared memory segment"), so it builds single-process with 200MB,
+#   enough to keep the whole graph in memory.
+# - The build takes ~2 minutes, and the Management API cancels statements
+#   after 2 minutes, so it runs as a one-off pg_cron job inside the database
+#   (no HTTP connection to time out). create_index() waits for it to finish.
 INDEX_SQL = """
+SET statement_timeout = 0;
 SET maintenance_work_mem = '200MB';
 SET max_parallel_maintenance_workers = 0;
 CREATE INDEX IF NOT EXISTS sentence_embeddings_embedding_hnsw
 ON public.sentence_embeddings USING hnsw (embedding extensions.halfvec_cosine_ops);
 ANALYZE public.sentence_embeddings;
 """
-
-
-def run_sql(sql):
-    """Run SQL as the database owner through the Supabase Management API."""
-    resp = requests.post(
-        f"https://api.supabase.com/v1/projects/{SUPABASE_PROJECT_REF}/database/query",
-        headers={"Authorization": f"Bearer {SUPABASE_ACCESS_TOKEN}",
-                 "Content-Type": "application/json"},
-        json={"query": sql},
-        timeout=600,
-    )
-    if resp.status_code not in (200, 201):
-        print(f"❌ SQL failed: {resp.status_code}")
-        print(resp.text[:1000])
-        sys.exit(1)
-    return resp.json()
 
 
 def create_schema():
@@ -473,7 +506,7 @@ def create_schema():
     print("✅ Database schema created successfully!")
 
     # Verify table exists via PostgREST
-    client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    client = create_client(SUPABASE_URL, os.environ['SUPABASE_SERVICE_KEY'])
     for attempt in range(5):
         try:
             result = client.table('sentence_embeddings').select('id', count='exact').limit(1).execute()
@@ -488,9 +521,22 @@ def create_schema():
 
 
 def create_index():
-    print("Building HNSW index (cosine)...")
+    print("Building HNSW index (cosine) as a one-off pg_cron job...")
     start = time.time()
-    run_sql(INDEX_SQL)
+    run_sql("CREATE EXTENSION IF NOT EXISTS pg_cron;")
+    job = run_sql(f"SELECT cron.schedule('build-hnsw', '* * * * *', $job${INDEX_SQL}$job$) AS id")[0]['id']
+    try:
+        while True:
+            time.sleep(15)
+            runs = run_sql(f"SELECT status, return_message FROM cron.job_run_details "
+                           f"WHERE jobid = {job} ORDER BY start_time LIMIT 1")
+            if runs and runs[0]['status'] not in ('starting', 'running'):
+                break
+    finally:
+        run_sql("SELECT cron.unschedule('build-hnsw');")
+    if runs[0]['status'] != 'succeeded':
+        print(f"❌ Index build {runs[0]['status']}: {runs[0]['return_message']}")
+        sys.exit(1)
     size = run_sql("SELECT pg_size_pretty(pg_relation_size('public.sentence_embeddings_embedding_hnsw')) AS index, "
                    "pg_size_pretty(pg_database_size(current_database())) AS database;")
     print(f"✅ Index built in {time.time() - start:.0f}s: {size}")

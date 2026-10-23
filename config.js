@@ -12,7 +12,7 @@
 // Default placeholder config — overwritten when config.public.json loads
 const SUPABASE_CONFIG = {
     url: 'YOUR_SUPABASE_URL_HERE',
-    anonKey: 'YOUR_SUPABASE_ANON_KEY_HERE'
+    publishableKey: 'YOUR_SUPABASE_PUBLISHABLE_KEY_HERE'
 };
 
 // Load config.public.json and update SUPABASE_CONFIG
@@ -23,7 +23,7 @@ fetch('config.public.json')
     })
     .then(config => {
         if (config.SUPABASE_URL) SUPABASE_CONFIG.url = config.SUPABASE_URL;
-        if (config.SUPABASE_PUBLISHABLE_KEY) SUPABASE_CONFIG.anonKey = config.SUPABASE_PUBLISHABLE_KEY;
+        if (config.SUPABASE_PUBLISHABLE_KEY) SUPABASE_CONFIG.publishableKey = config.SUPABASE_PUBLISHABLE_KEY;
         // Re-initialize now that config is loaded
         window.dispatchEvent(new Event('config-loaded'));
     })

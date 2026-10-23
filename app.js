@@ -12,11 +12,11 @@ function isConfigValid() {
         SUPABASE_CONFIG.url === 'https://your-project-ref.supabase.co' ||
         SUPABASE_CONFIG.url === 'https://YOUR_PROJECT_REF.supabase.co';
 
-    const isPlaceholderKey = !SUPABASE_CONFIG.anonKey ||
-        SUPABASE_CONFIG.anonKey.includes('YOUR_SUPABASE') ||
-        SUPABASE_CONFIG.anonKey.includes('your-anon-key') ||
-        SUPABASE_CONFIG.anonKey === 'YOUR_SUPABASE_ANON_KEY_HERE' ||
-        SUPABASE_CONFIG.anonKey.length < 20;
+    const isPlaceholderKey = !SUPABASE_CONFIG.publishableKey ||
+        SUPABASE_CONFIG.publishableKey.includes('YOUR_SUPABASE') ||
+        SUPABASE_CONFIG.publishableKey.includes('your-anon-key') ||
+        SUPABASE_CONFIG.publishableKey === 'YOUR_SUPABASE_PUBLISHABLE_KEY_HERE' ||
+        SUPABASE_CONFIG.publishableKey.length < 20;
 
     return !isPlaceholderUrl && !isPlaceholderKey;
 }
@@ -32,7 +32,7 @@ function initializeSupabase() {
         try {
             supabaseClient = window.supabase.createClient(
                 SUPABASE_CONFIG.url,
-                SUPABASE_CONFIG.anonKey
+                SUPABASE_CONFIG.publishableKey
             );
             // Listen for auth state changes
             supabaseClient.auth.onAuthStateChange((event, session) => {
@@ -316,58 +316,39 @@ function showLoading(show) {
 // Guard against double execution (checkSession + onAuthStateChange both call showApp)
 let readinessCheckRunning = false;
 
+// Ping an Edge Function: proves it's deployed and accepts this login, costs nothing.
+async function pingFunction(name) {
+    try {
+        const { error } = await supabaseClient.functions.invoke(name, { body: { ping: true } });
+        return !error;
+    } catch {
+        return false;   // CORS or network error -> function not deployed
+    }
+}
+
 async function checkSearchReadiness() {
     if (!supabaseClient || readinessCheckRunning) return;
     readinessCheckRunning = true;
 
+    // Each panel appears once here; every check after the first only runs if
+    // the one before it passed, so no function is pinged needlessly.
+    const ready = { keyword: false, semantic: false, smart: false, rag: false };
     try {
-        // --- Check 1: Any data at all? (keyword search just needs text) ---
         // "Is there at least one row?" stays fast at any table size, unlike count(*).
-        const { data: anyRow, error: totalError } = await supabaseClient
+        const { data: anyRow, error } = await supabaseClient
             .from('sentence_embeddings')
             .select('id')
             .limit(1);
-
-        const hasData = !totalError && anyRow.length > 0;
-        setSearchReady('keyword', hasData);
-
-        // --- Check 2: embed-question ping (proves deploy + login, no OpenAI call) ---
-        // The embedding column itself is hidden from the browser, so the
-        // function ping is the semantic readiness check.
-        let semanticReady = false;
-        if (hasData) {
-            try {
-                const { data, error: fnError } = await supabaseClient.functions.invoke('embed-question', {
-                    body: { ping: true }
-                });
-                semanticReady = !fnError;
-            } catch {
-                // CORS or network error → function not deployed
-            }
-        }
-        setSearchReady('semantic', semanticReady);
-        setSearchReady('smart', semanticReady);
-
-        // --- 1 generate-answer call (only if semantic pipeline is ready) ---
-        if (!semanticReady) {
-            setSearchReady('rag', false);
-        } else {
-            try {
-                const { data, error: fnError } = await supabaseClient.functions.invoke('generate-answer', {
-                    body: { ping: true }
-                });
-                setSearchReady('rag', !fnError);
-            } catch {
-                setSearchReady('rag', false);
-            }
-        }
+        ready.keyword = !error && anyRow.length > 0;
+        // The embedding column is hidden from the browser, so the function
+        // ping is the semantic readiness check.
+        ready.semantic = ready.keyword && await pingFunction('embed-question');
+        ready.smart = ready.semantic;
+        ready.rag = ready.semantic && await pingFunction('generate-answer');
     } catch (err) {
         console.log('Readiness check failed:', err.message);
-        setSearchReady('keyword', false);
-        setSearchReady('semantic', false);
-        setSearchReady('smart', false);
-        setSearchReady('rag', false);
     } finally {
+        for (const [type, ok] of Object.entries(ready)) setSearchReady(type, ok);
         readinessCheckRunning = false;
     }
 }
@@ -592,48 +573,37 @@ async function askQuestion() {
     clearResults('rag');
 
     try {
-        // Step 1: Get embedding
-        const embedding = await getEmbedding(question);
+        // The server picks the talks (Smart Search), reads them in full and
+        // answers; sources are exactly the talks GPT-4o was given.
+        const { answer, sources } = await generateAnswer(question);
 
-        // Step 2: Pick the 3 talks closest to the question's intent (Smart Search)
-        const topTalks = await smartTalks(question, embedding, 3);
-        if (!topTalks.length) {
-            showResults('rag', '<div class="no-results">No relevant talks found. Try rephrasing.</div>');
-            return;
-        }
+        // Overall badge: average best-sentence similarity of the sources found
+        // by meaning. Talks found only by keyword have no similarity (null).
+        const scored = sources.filter(t => t.similarity != null);
+        const overallSimilarity = scored.length
+            ? scored.reduce((sum, t) => sum + t.similarity, 0) / scored.length
+            : null;
 
-        // Step 3: Fetch full talk text for richer context
-        const enrichedTalks = await fetchFullTalkText(topTalks);
-
-        // Step 4: Generate answer with full context
-        const answer = await generateAnswer(question, enrichedTalks);
-
-        // Overall badge: average of each source talk's best sentence similarity
-        const overallSimilarity = topTalks.reduce((sum, t) => sum + t.similarity, 0) / topTalks.length;
-        const overallBadge = similarityBadge(overallSimilarity);
-        const simClass = overallSimilarity >= 0.70 ? 'similarity-high'
-            : overallSimilarity >= 0.40 ? 'similarity-mid' : 'similarity-low';
-
-        let html = `<div class="result-card rag-answer rag-${simClass}">
+        let html = `<div class="result-card rag-answer ${overallSimilarity != null ? 'rag-' + similarityClass(overallSimilarity) : ''}">
             <div class="result-card-header">
                 <div class="result-title">AI Answer</div>
-                ${overallBadge}
+                ${overallSimilarity != null ? similarityBadge(overallSimilarity) : ''}
             </div>
             <div class="result-sentences">${escapeHtml(answer)}</div>
             <div class="result-disclaimer">AI-generated summary. Read the linked talks for what was actually said.</div>
         </div>`;
 
-        // Show source talks with per-talk similarity badges and links
-        html += '<div class="result-sources"><strong>Sources:</strong></div>';
-        for (const talk of topTalks) {
-            const talkBadge = similarityBadge(talk.similarity);
+        if (sources.length) html += '<div class="result-sources"><strong>Sources:</strong></div>';
+        for (const talk of sources) {
+            const url = safeTalkUrl(talk.url);
+            const title = escapeHtml(talk.title);
             html += `<div class="result-card result-source">
                 <div class="result-card-header">
                     <div>
-                        <div class="result-title"><a href="${escapeHtml(talk.url)}" target="_blank" class="result-title-link">${escapeHtml(talk.title)}</a></div>
+                        <div class="result-title">${url ? `<a href="${escapeHtml(url)}" target="_blank" class="result-title-link">${title}</a>` : title}</div>
                         <div class="result-speaker">${speakerLine(talk)}</div>
                     </div>
-                    ${talkBadge}
+                    ${talk.similarity != null ? similarityBadge(talk.similarity) : '<span class="similarity-badge similarity-mid">Keyword match</span>'}
                 </div>
             </div>`;
         }
@@ -651,17 +621,19 @@ async function askQuestion() {
 // SHARED SEARCH UTILITIES
 // ============================================
 
+// The server's error message from a failed Edge Function call. On a non-2xx
+// reply supabase-js hides the Response in error.context.
+async function functionErrorMessage(error, fallback) {
+    const body = await error.context?.json?.().catch(() => null);
+    return body?.error || fallback;
+}
+
 // Get embedding via Edge Function
 async function getEmbedding(text) {
     const { data, error } = await supabaseClient.functions.invoke('embed-question', {
         body: { question: text }
     });
-
-    if (error) {
-        const body = await error.context?.json?.().catch(() => null);
-        throw new Error(body?.error || 'Failed to get embedding');
-    }
-
+    if (error) throw new Error(await functionErrorMessage(error, 'Failed to get embedding'));
     return data.embedding;
 }
 
@@ -678,82 +650,13 @@ async function searchSentences(embedding) {
     return data;
 }
 
-// Pick talks with Smart Search: semantic + full-text rankings fused with
-// Reciprocal Rank Fusion (see smart_search in scripts/01_create_schema.py).
-async function smartTalks(query, embedding, count) {
-    const { data, error } = await supabaseClient.rpc('smart_search', {
-        q: query,
-        query_embedding: embedding,
-        max_talks: count
-    });
-    if (error) throw new Error(`Smart search failed: ${error.message}`);
-    return data.map(talk => ({
-        talk_id: talk.talk_id,
-        title: talk.title,
-        speaker: talk.speaker,
-        url: talk.url,
-        conference: conferenceLabel(talk),
-        text: (talk.snippets || []).join(' '),   // replaced by the full talk below
-        score: talk.score,
-        // Talks found only by words have no similarity; show 0 rather than nothing.
-        similarity: talk.best_similarity || 0
-    }));
-}
-
-// Fetch full talk text by querying all sentences for given talk_ids, ordered by sentence_num.
-// Uses a single batched query via .in() for all talk_ids — no parallel calls needed.
-async function fetchFullTalkText(talks) {
-    if (!supabaseClient || !talks.length) return talks;
-
-    const talkIds = talks.map(t => t.talk_id);
-
-    const { data, error } = await supabaseClient
-        .from('sentence_embeddings')
-        .select('talk_id, sentence_num, text')
-        .in('talk_id', talkIds)
-        .order('talk_id')
-        .order('sentence_num');
-
-    if (error || !data) {
-        console.warn('Failed to fetch full talk text, using snippets:', error?.message);
-        return talks;
-    }
-
-    // Group fetched sentences by talk_id
-    const fullTextMap = {};
-    for (const row of data) {
-        if (!fullTextMap[row.talk_id]) fullTextMap[row.talk_id] = [];
-        fullTextMap[row.talk_id].push(row.text);
-    }
-
-    // Replace snippet text with full talk text
-    return talks.map(talk => ({
-        ...talk,
-        text: fullTextMap[talk.talk_id]
-            ? fullTextMap[talk.talk_id].join(' ')
-            : talk.text
-    }));
-}
-
-// Generate answer via Edge Function
-async function generateAnswer(question, contextTalks) {
+// Ask the RAG Edge Function: returns { answer, sources }
+async function generateAnswer(question) {
     const { data, error } = await supabaseClient.functions.invoke('generate-answer', {
-        body: {
-            question: question,
-            context_talks: contextTalks
-        }
+        body: { question }
     });
-
-    if (error) {
-        // On a non-2xx reply supabase-js gives the Response in error.context.
-        const body = await error.context?.json?.().catch(() => null);
-        if (error.context?.status === 429) {
-            throw new Error('You have reached the limit of 20 questions per hour. Please try again later.');
-        }
-        throw new Error(body?.error || 'Failed to generate answer');
-    }
-
-    return data.answer;
+    if (error) throw new Error(await functionErrorMessage(error, 'Failed to generate answer'));
+    return data;
 }
 
 // ============================================
@@ -776,18 +679,17 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
+// Color tier for a similarity score (used by badges and the RAG answer card)
+function similarityClass(similarity) {
+    if (similarity >= 0.70) return 'similarity-high';
+    if (similarity >= 0.40) return 'similarity-mid';
+    return 'similarity-low';
+}
+
 // Similarity badge with color coding
 function similarityBadge(similarity) {
     const pct = (similarity * 100).toFixed(0);
-    let cls;
-    if (similarity >= 0.70) {
-        cls = 'similarity-high';
-    } else if (similarity >= 0.40) {
-        cls = 'similarity-mid';
-    } else {
-        cls = 'similarity-low';
-    }
-    return `<span class="similarity-badge ${cls}">${pct}%</span>`;
+    return `<span class="similarity-badge ${similarityClass(similarity)}">${pct}%</span>`;
 }
 
 // ============================================
@@ -800,7 +702,7 @@ if (keywordInput) keywordInput.addEventListener('keypress', (e) => {
     if (e.key === 'Enter') keywordSearch();
 });
 
-// Semantic search
+// Smart and semantic search
 if (smartBtn) smartBtn.addEventListener('click', smartSearch);
 if (smartInput) smartInput.addEventListener('keypress', (e) => {
     if (e.key === 'Enter') smartSearch();
@@ -894,7 +796,9 @@ async function loadHistory() {
 if (historyResults) historyResults.addEventListener('click', async (e) => {
     const btn = e.target.closest('.history-delete');
     if (!btn) return;
-    const { error } = await supabaseClient.from('my_questions').delete().eq('id', btn.dataset.id);
+    // Hides the question rather than deleting it, so it still counts toward
+    // the hourly limit (see hide_question in scripts/01_create_schema.py).
+    const { error } = await supabaseClient.rpc('hide_question', { p_id: btn.dataset.id });
     if (error) alert(`Delete failed: ${error.message}`);
     loadHistory();
 });
@@ -915,10 +819,13 @@ function recordPageView() {
     supabaseClient
         .rpc('record_view', { p_url: window.location.href })
         .then(() => {
-            // Query the total count
+            // Views in the last 30 days. record_view() also drops older rows and
+            // keeps at most 10,000, so this is a recent count, not an all-time total.
+            const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
             return supabaseClient
                 .from('page_views')
-                .select('*', { count: 'exact', head: true });
+                .select('*', { count: 'exact', head: true })
+                .gte('visited_at', since);
         })
         .then(({ count }) => {
             if (pageViewsEl && count != null) {

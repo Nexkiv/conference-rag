@@ -21,4 +21,3 @@ export function serverError(err: unknown, message: string, status = 500): Respon
     return json({ error: message, error_id: errorId }, status);
 }
 
-export const MAX_QUESTION_CHARS = 500;

@@ -14,7 +14,7 @@ Input:
     scripts/output/sentences_with_embeddings.json  — from Step 4
 
 Prerequisites:
-    - config.public.json with Supabase URL and anon key
+    - config.public.json with the Supabase URL
     - SUPABASE_SERVICE_KEY environment variable
     - Database schema created (Step 1)
     - Embeddings generated (Step 4)

@@ -18,7 +18,7 @@ Output:
     scripts/output/sentences.json  — sentence records with talk_id + sentence_num
 
 Prerequisites:
-    - config.public.json with Supabase URL and anon key
+    - config.public.json with the Supabase URL
     - SUPABASE_SERVICE_KEY environment variable
     - Database schema created (Step 1)
     - Talks scraped (Step 2)
