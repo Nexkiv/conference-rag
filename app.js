@@ -595,20 +595,21 @@ async function askQuestion() {
         // Step 1: Get embedding
         const embedding = await getEmbedding(question);
 
-        // Step 2: Search for similar sentences
-        const results = await searchSentences(embedding);
+        // Step 2: Pick the 3 talks closest to the question's intent (Smart Search)
+        const topTalks = await smartTalks(question, embedding, 3);
+        if (!topTalks.length) {
+            showResults('rag', '<div class="no-results">No relevant talks found. Try rephrasing.</div>');
+            return;
+        }
 
-        // Step 3: Group by talk (with similarity scores and URLs)
-        const topTalks = groupByTalk(results);
-
-        // Step 4: Fetch full talk text for richer context
+        // Step 3: Fetch full talk text for richer context
         const enrichedTalks = await fetchFullTalkText(topTalks);
 
-        // Step 5: Generate answer with full context
+        // Step 4: Generate answer with full context
         const answer = await generateAnswer(question, enrichedTalks);
 
-        // Compute overall similarity (weighted avg across source talks)
-        const overallSimilarity = topTalks.reduce((sum, t) => sum + t.avgSimilarity, 0) / topTalks.length;
+        // Overall badge: average of each source talk's best sentence similarity
+        const overallSimilarity = topTalks.reduce((sum, t) => sum + t.similarity, 0) / topTalks.length;
         const overallBadge = similarityBadge(overallSimilarity);
         const simClass = overallSimilarity >= 0.70 ? 'similarity-high'
             : overallSimilarity >= 0.40 ? 'similarity-mid' : 'similarity-low';
@@ -625,7 +626,7 @@ async function askQuestion() {
         // Show source talks with per-talk similarity badges and links
         html += '<div class="result-sources"><strong>Sources:</strong></div>';
         for (const talk of topTalks) {
-            const talkBadge = similarityBadge(talk.avgSimilarity);
+            const talkBadge = similarityBadge(talk.similarity);
             html += `<div class="result-card result-source">
                 <div class="result-card-header">
                     <div>
@@ -677,44 +678,26 @@ async function searchSentences(embedding) {
     return data;
 }
 
-// Group search results by talk, computing average similarity per talk
-function groupByTalk(sentences) {
-    const talkMap = {};
-
-    for (const sent of sentences) {
-        if (!talkMap[sent.talk_id]) {
-            talkMap[sent.talk_id] = {
-                talk_id: sent.talk_id,
-                title: sent.title,
-                speaker: sent.speaker,
-                url: sent.url,
-                conference: conferenceLabel(sent),
-                sentences: [],
-                totalSimilarity: 0,
-                talkSentences: sent.talk_sentences || 1
-            };
-        }
-        talkMap[sent.talk_id].sentences.push(sent.text);
-        talkMap[sent.talk_id].totalSimilarity += sent.similarity;
-    }
-
-    // Rank by sum of similarities / sqrt(talk length): rewards talks that keep
-    // returning to the question, without letting long talks win on volume alone.
-    const score = t => t.totalSimilarity / Math.sqrt(t.talkSentences);
-    return Object.values(talkMap)
-        .sort((a, b) => score(b) - score(a))
-        .slice(0, 3)
-        .map(talk => ({
-            talk_id: talk.talk_id,
-            title: talk.title,
-            speaker: talk.speaker,
-            url: talk.url,
-            conference: talk.conference,
-            text: talk.sentences.join(' '),
-            score: score(talk),
-            // Average is still the clearest number to show as a badge.
-            avgSimilarity: talk.totalSimilarity / talk.sentences.length
-        }));
+// Pick talks with Smart Search: semantic + full-text rankings fused with
+// Reciprocal Rank Fusion (see smart_search in scripts/01_create_schema.py).
+async function smartTalks(query, embedding, count) {
+    const { data, error } = await supabaseClient.rpc('smart_search', {
+        q: query,
+        query_embedding: embedding,
+        max_talks: count
+    });
+    if (error) throw new Error(`Smart search failed: ${error.message}`);
+    return data.map(talk => ({
+        talk_id: talk.talk_id,
+        title: talk.title,
+        speaker: talk.speaker,
+        url: talk.url,
+        conference: conferenceLabel(talk),
+        text: (talk.snippets || []).join(' '),   // replaced by the full talk below
+        score: talk.score,
+        // Talks found only by words have no similarity; show 0 rather than nothing.
+        similarity: talk.best_similarity || 0
+    }));
 }
 
 // Fetch full talk text by querying all sentences for given talk_ids, ordered by sentence_num.

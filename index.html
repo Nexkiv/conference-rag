@@ -10,7 +10,7 @@
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; connect-src 'self' https://xbvnczcyxtiusbxhajdc.supabase.co; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
     <title>Supabase RAG - Conference Q&A</title>
     <!-- ?v=... busts the browser cache (Pages caches files for 10 min): bump it when app.js, config.js or styles.css change. -->
-    <link rel="stylesheet" href="styles.css?v=20261022b">
+    <link rel="stylesheet" href="styles.css?v=20261022c">
 </head>
 
 <body>
@@ -144,8 +144,8 @@
                         <h3>🤖 Ask a Question (RAG)</h3>
                         <span class="status-badge not-ready" id="rag-status">🔴 Not Ready</span>
                     </div>
-                    <p class="panel-description">Get AI-generated answers based on conference talks. Requires all Edge
-                        Functions deployed.</p>
+                    <p class="panel-description">Get AI-generated answers based on conference talks. Smart Search picks the
+                        3 talks closest to your question; GPT-4o answers from them and cites them.</p>
                     <div class="panel-input">
                         <input type="text" id="rag-input" maxlength="500" placeholder="Ask a question about conference talks..."
                             autocomplete="off" disabled />
@@ -179,10 +179,10 @@
         crossorigin="anonymous"></script>
 
     <!-- Configuration (Students will replace this) -->
-    <script src="config.js?v=20261022b"></script>
+    <script src="config.js?v=20261022c"></script>
 
     <!-- Main Application Logic -->
-    <script src="app.js?v=20261022b"></script>
+    <script src="app.js?v=20261022c"></script>
 </body>
 
 </html>
