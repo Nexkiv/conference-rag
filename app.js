@@ -319,29 +319,23 @@ async function checkSearchReadiness() {
 
     try {
         // --- Check 1: Any data at all? (keyword search just needs text) ---
-        const { count: totalCount, error: totalError } = await supabaseClient
+        // "Is there at least one row?" stays fast at any table size, unlike count(*).
+        const { data: anyRow, error: totalError } = await supabaseClient
             .from('sentence_embeddings')
-            .select('*', { count: 'exact', head: true });
+            .select('id')
+            .limit(1);
 
-        const hasData = !totalError && totalCount > 0;
+        const hasData = !totalError && anyRow.length > 0;
         setSearchReady('keyword', hasData);
 
-        // --- Check 2: Data with embeddings? (semantic search needs vectors) ---
-        let hasEmbeddings = false;
-        if (hasData) {
-            const { count, error } = await supabaseClient
-                .from('sentence_embeddings')
-                .select('*', { count: 'exact', head: true })
-                .not('embedding', 'is', null);
-            hasEmbeddings = !error && count > 0;
-        }
-
-        // --- 1 embed-question call (only if DB has embeddings) ---
+        // --- Check 2: embed-question ping (proves deploy + login, no OpenAI call) ---
+        // The embedding column itself is hidden from the browser, so the
+        // function ping is the semantic readiness check.
         let semanticReady = false;
-        if (hasEmbeddings) {
+        if (hasData) {
             try {
                 const { data, error: fnError } = await supabaseClient.functions.invoke('embed-question', {
-                    body: { question: 'test' }
+                    body: { ping: true }
                 });
                 semanticReady = !fnError;
             } catch {
@@ -356,9 +350,9 @@ async function checkSearchReadiness() {
         } else {
             try {
                 const { data, error: fnError } = await supabaseClient.functions.invoke('generate-answer', {
-                    body: { question: 'test', context_talks: [] }
+                    body: { ping: true }
                 });
-                setSearchReady('rag', !fnError || fnError.context?.status !== 404);
+                setSearchReady('rag', !fnError);
             } catch {
                 setSearchReady('rag', false);
             }
@@ -554,6 +548,7 @@ async function askQuestion() {
                 ${overallBadge}
             </div>
             <div class="result-sentences">${escapeHtml(answer)}</div>
+            <div class="result-disclaimer">AI-generated summary. Read the linked talks for what was actually said.</div>
         </div>`;
 
         // Show source talks with per-talk similarity badges and links
@@ -621,15 +616,19 @@ function groupByTalk(sentences) {
                 speaker: sent.speaker,
                 url: sent.url,
                 sentences: [],
-                totalSimilarity: 0
+                totalSimilarity: 0,
+                talkSentences: sent.talk_sentences || 1
             };
         }
         talkMap[sent.talk_id].sentences.push(sent.text);
         talkMap[sent.talk_id].totalSimilarity += sent.similarity;
     }
 
+    // Rank by sum of similarities / sqrt(talk length): rewards talks that keep
+    // returning to the question, without letting long talks win on volume alone.
+    const score = t => t.totalSimilarity / Math.sqrt(t.talkSentences);
     return Object.values(talkMap)
-        .sort((a, b) => b.totalSimilarity / b.sentences.length - a.totalSimilarity / a.sentences.length)
+        .sort((a, b) => score(b) - score(a))
         .slice(0, 3)
         .map(talk => ({
             talk_id: talk.talk_id,
@@ -637,10 +636,8 @@ function groupByTalk(sentences) {
             speaker: talk.speaker,
             url: talk.url,
             text: talk.sentences.join(' '),
-            // TODO: Is average similarity the right metric? Alternatives worth researching:
-            // - Max similarity (best single match per talk)
-            // - Average of top-3 sentences (reduces noise from weak matches)
-            // - Weighted by sentence count (rewards talks with more matches)
+            score: score(talk),
+            // Average is still the clearest number to show as a badge.
             avgSimilarity: talk.totalSimilarity / talk.sentences.length
         }));
 }
@@ -778,21 +775,17 @@ function fetchDeployTimestamp() {
 // ============================================
 // PAGE VIEW COUNTER
 // ============================================
-// Demonstrates public RLS policies: this works without authentication
-// because page_views has anon INSERT + SELECT policies.
+// Demonstrates public access: this works without authentication. Reads use a
+// public SELECT policy; writes go through record_view(), which caps the table.
 
 function recordPageView() {
     if (!supabaseClient) return;
 
     const pageViewsEl = document.getElementById('page-views-count');
 
-    // Insert a page view (best-effort, no auth required)
+    // Record a page view (best-effort, no auth required)
     supabaseClient
-        .from('page_views')
-        .insert({
-            page_url: window.location.href,
-            user_agent: navigator.userAgent
-        })
+        .rpc('record_view', { p_url: window.location.href })
         .then(() => {
             // Query the total count
             return supabaseClient

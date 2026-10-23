@@ -4,10 +4,10 @@
 // This file reads your Supabase credentials from config.public.json.
 // config.public.json contains values that are SAFE to commit:
 //   - Supabase URL
-//   - Supabase anon key (protected by Row Level Security)
+//   - Supabase publishable key (protected by Row Level Security)
 //
-// SECRET values (API keys, service keys) go in config.secret.json
-// which is git-ignored and NEVER committed.
+// SECRET values (OpenAI key, Supabase secret key, access token) live only in
+// environment variables on the machine that runs the scripts. Never in files.
 
 // Default placeholder config — overwritten when config.public.json loads
 const SUPABASE_CONFIG = {
@@ -23,11 +23,11 @@ fetch('config.public.json')
     })
     .then(config => {
         if (config.SUPABASE_URL) SUPABASE_CONFIG.url = config.SUPABASE_URL;
-        if (config.SUPABASE_ANON_KEY) SUPABASE_CONFIG.anonKey = config.SUPABASE_ANON_KEY;
+        if (config.SUPABASE_PUBLISHABLE_KEY) SUPABASE_CONFIG.anonKey = config.SUPABASE_PUBLISHABLE_KEY;
         // Re-initialize now that config is loaded
         window.dispatchEvent(new Event('config-loaded'));
     })
     .catch(err => {
         console.warn('⚠️ Could not load config.public.json:', err.message);
-        console.warn('   Create config.public.json with your Supabase URL and anon key.');
+        console.warn('   Create config.public.json with your Supabase URL and publishable key.');
     });

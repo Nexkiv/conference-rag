@@ -17,7 +17,7 @@ Output:
     scripts/output/sentences_with_embeddings.json  — sentence records with embedding vectors
 
 Prerequisites:
-    - config.secret.json with OPENAI_API_KEY
+    - OPENAI_API_KEY environment variable
     - scripts/output/sentences.json from the import step
 """
 
@@ -33,11 +33,9 @@ from tqdm import tqdm
 INPUT_FILE = os.path.join('scripts', 'output', 'sentences.json')
 OUTPUT_FILE = os.path.join('scripts', 'output', 'sentences_with_embeddings.json')
 BATCH_SIZE = 100
-
-
-def load_secrets():
-    with open('config.secret.json', 'r') as f:
-        return json.load(f)
+# Full size for text-embedding-3-small. Stored as halfvec(1536) in the DB.
+# embed-question must ask for the same size.
+DIMENSIONS = 1536
 
 
 def main():
@@ -72,8 +70,7 @@ def main():
         records_to_embed = records
 
     # Generate embeddings
-    secrets = load_secrets()
-    client = OpenAI(api_key=secrets['OPENAI_API_KEY'])
+    client = OpenAI()  # reads OPENAI_API_KEY from the environment
 
     embedded_records = list(existing)  # Start from any partial results
     errors = 0
@@ -85,7 +82,8 @@ def main():
         try:
             response = client.embeddings.create(
                 model='text-embedding-3-small',
-                input=batch_texts
+                input=batch_texts,
+                dimensions=DIMENSIONS
             )
 
             for record, item in zip(batch, response.data):

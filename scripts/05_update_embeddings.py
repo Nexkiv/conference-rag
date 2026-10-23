@@ -15,7 +15,7 @@ Input:
 
 Prerequisites:
     - config.public.json with Supabase URL and anon key
-    - config.secret.json with Supabase service key
+    - SUPABASE_SERVICE_KEY environment variable
     - Database schema created (Step 1)
     - Embeddings generated (Step 4)
 """
@@ -36,8 +36,8 @@ BATCH_SIZE = 100
 def load_config():
     with open('config.public.json', 'r') as f:
         public_config = json.load(f)
-    with open('config.secret.json', 'r') as f:
-        secrets = json.load(f)
+    # Secrets come from environment variables only, never from a file.
+    secrets = {'SUPABASE_SERVICE_KEY': os.environ['SUPABASE_SERVICE_KEY']}
     return public_config, secrets
 
 

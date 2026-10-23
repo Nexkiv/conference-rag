@@ -25,9 +25,9 @@ from bs4 import BeautifulSoup
 from tqdm import tqdm
 
 
-YEARS_TO_SCRAPE = 5
-START_YEAR = 2025 - YEARS_TO_SCRAPE
-END_YEAR = 2025
+YEARS_TO_SCRAPE = 6
+END_YEAR = 2026
+START_YEAR = END_YEAR - YEARS_TO_SCRAPE
 OUTPUT_DIR = os.path.join('scripts', 'output')
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, 'talks.json')
 

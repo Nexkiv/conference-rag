@@ -4,6 +4,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- CSP: scripts only from this site and the pinned CDN library; requests only to
+         our Supabase project. GitHub Pages cannot send headers, so frame-ancestors
+         (click-jacking protection) is not available here. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; connect-src 'self' https://xbvnczcyxtiusbxhajdc.supabase.co; img-src 'self' data:; style-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
     <title>Supabase RAG - Conference Q&A</title>
     <link rel="stylesheet" href="styles.css">
 </head>
@@ -94,7 +98,7 @@
                     <p class="panel-description">Search conference talks by keyword. Works once you import the
                         conference data.</p>
                     <div class="panel-input">
-                        <input type="text" id="keyword-input" placeholder="Search by keyword..." autocomplete="off"
+                        <input type="text" id="keyword-input" maxlength="500" placeholder="Search by keyword..." autocomplete="off"
                             disabled />
                         <button id="keyword-btn" class="btn-primary" disabled>Search</button>
                     </div>
@@ -110,7 +114,7 @@
                     <p class="panel-description">Find similar content by meaning, not just keywords. Requires embeddings
                         and the embed-question Edge Function.</p>
                     <div class="panel-input">
-                        <input type="text" id="semantic-input" placeholder="Search by meaning..." autocomplete="off"
+                        <input type="text" id="semantic-input" maxlength="500" placeholder="Search by meaning..." autocomplete="off"
                             disabled />
                         <button id="semantic-btn" class="btn-primary" disabled>Search</button>
                     </div>
@@ -126,7 +130,7 @@
                     <p class="panel-description">Get AI-generated answers based on conference talks. Requires all Edge
                         Functions deployed.</p>
                     <div class="panel-input">
-                        <input type="text" id="rag-input" placeholder="Ask a question about conference talks..."
+                        <input type="text" id="rag-input" maxlength="500" placeholder="Ask a question about conference talks..."
                             autocomplete="off" disabled />
                         <button id="rag-btn" class="btn-primary" disabled>Ask</button>
                     </div>
@@ -142,7 +146,10 @@
     </div>
 
     <!-- Supabase JS Client -->
-    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <!-- Pinned version + SRI: the browser refuses to run the file if its bytes change. -->
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.118.0/dist/umd/supabase.js"
+        integrity="sha384-TcHRA3zBbn+Lexh5n+Oil4guNPOS3rjNDpGRAN46u/s/mB2IZ50ceC6TYDU2yvgK"
+        crossorigin="anonymous"></script>
 
     <!-- Configuration (Students will replace this) -->
     <script src="config.js"></script>
