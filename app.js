@@ -472,7 +472,8 @@ function speakerLine(talk) {
 
 function highlightKeyword(text, keyword) {
     const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp(`(${escaped})`, 'gi');
+    // Whole words only, like keyword_search(): "the" is not marked inside "strengthen".
+    const regex = new RegExp(`(?<![\\p{L}\\p{N}])(${escaped})(?![\\p{L}\\p{N}])`, 'giu');
     return escapeHtml(text).replace(regex, '<mark>$1</mark>');
 }
 

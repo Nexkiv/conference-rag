@@ -225,7 +225,7 @@ REVOKE ALL ON FUNCTION public.match_sentences(extensions.halfvec, int) FROM publ
 GRANT EXECUTE ON FUNCTION public.match_sentences(extensions.halfvec, int) TO authenticated;
 
 -- ============================================
--- keyword_search: ILIKE search, ranked per talk
+-- keyword_search: whole-word search, ranked per talk
 -- ============================================
 -- Each talk that uses the words (or has them in its title) gets
 --     score = (matching sentences + 5 * title_match) / sqrt(talk sentences)
@@ -234,8 +234,12 @@ GRANT EXECUTE ON FUNCTION public.match_sentences(extensions.halfvec, int) TO aut
 -- talks from winning on volume alone (same idea as the RAG ranking).
 -- Returns up to 3 matching sentences per talk (or the opening sentence for a
 -- title-only match). SECURITY INVOKER: runs as the caller, so RLS and the
--- column grants above still apply. %, _ and ! in the query are escaped with !
--- (ESCAPE '!'), so they match literally.
+-- column grants above still apply.
+-- Matching is whole-word and case-insensitive: a regex ~* wrapped in the
+-- word-boundary escapes m and M (start/end of word), so "the" no longer matches "strengthen". Every
+-- character that isn't a letter, digit or space is escaped, so the query
+-- matches literally. chr(92) is a backslash, written that way to keep
+-- backslashes out of this Python string.
 DROP FUNCTION IF EXISTS public.keyword_search(text, int);
 CREATE FUNCTION public.keyword_search(q text, max_talks int DEFAULT 10)
 RETURNS TABLE (
@@ -256,21 +260,23 @@ SECURITY INVOKER
 SET search_path = public
 AS $$
     WITH pat AS (
-        SELECT '%' || replace(replace(replace(left(q, 500), '!', '!!'), '%', '!%'), '_', '!_') || '%' AS p
+        SELECT chr(92) || 'm'
+               || regexp_replace(trim(left(q, 500)), '([^[:alnum:][:space:]])', repeat(chr(92), 3) || '1', 'g')
+               || chr(92) || 'M' AS p
     ),
     matches AS (
         SELECT s.talk_id, s.sentence_num, s.text
         FROM public.sentence_embeddings s, pat
-        WHERE s.text ILIKE pat.p ESCAPE '!'
+        WHERE s.text ~* pat.p
     ),
     talks AS (
         SELECT s.talk_id,
                min(s.title) AS title, min(s.speaker) AS speaker, min(s.url) AS url,
                min(s.year) AS year, min(s.season) AS season,
                count(*) AS n,
-               bool_or(s.title ILIKE pat.p ESCAPE '!') AS title_match
+               bool_or(s.title ~* pat.p) AS title_match
         FROM public.sentence_embeddings s, pat
-        WHERE s.talk_id IN (SELECT m.talk_id FROM matches m) OR s.title ILIKE pat.p ESCAPE '!'
+        WHERE s.talk_id IN (SELECT m.talk_id FROM matches m) OR s.title ~* pat.p
         GROUP BY s.talk_id
     ),
     ranked AS (
@@ -302,8 +308,12 @@ NOTIFY pgrst, 'reload schema';
 
 # Built after the embeddings are loaded: one bulk build is much faster than
 # updating the graph on every insert.
+# The free tier's shared memory can't hold a big parallel build ("could not
+# resize shared memory segment"), so build single-process. 200MB holds the
+# whole graph in memory, which keeps the build under the API's ~100 s timeout.
 INDEX_SQL = """
-SET maintenance_work_mem = '256MB';
+SET maintenance_work_mem = '200MB';
+SET max_parallel_maintenance_workers = 0;
 CREATE INDEX IF NOT EXISTS sentence_embeddings_embedding_hnsw
 ON public.sentence_embeddings USING hnsw (embedding extensions.halfvec_cosine_ops);
 ANALYZE public.sentence_embeddings;
